@@ -106,27 +106,45 @@ class Field (α : Type) extends Add α, Sub α, Neg α, Mul α, Inv α, LE α wh
 
 open Field (mulByNonResidual)
 
+/-- Halves `a` for as long as it stays even; helper function of `binaryInversion`. -/
+private def evenLoop (p a b : Nat) : Nat × Nat :=
+  if h : a ≠ 0 ∧ 2 ∣ a
+    then evenLoop p (a / 2) ((if 2 ∣ b then b else b + p) / 2)
+    else (a, b)
+  termination_by a
+  decreasing_by exact Nat.div_lt_self (Nat.pos_of_ne_zero h.1) (by omega)
+
+/-- `evenLoop` never grows its first component. This is what makes `u + v` decrease in
+    `binaryInversion.loop`, so it has to be available before that definition. -/
+theorem evenLoop_fst_le (p a b : Nat) : (evenLoop p a b).1 ≤ a :=
+  by
+    fun_induction evenLoop with
+    | case1 a b h ih => simp only [dite_eq_ite] at ih; omega
+    | case2 a b h    => simp
+
 /-- Calculating the multiplicative inverse of `a` over the cyclic
     `p` field. -/
-partial def binaryInversion (a p : Nat) : Nat :=
+def binaryInversion (a p : Nat) : Nat :=
   if a == 0
-    then panic! "inv of 0"
+    then 0 -- 0 has no inverse
     else loop a p 1 0
-
  where
-
-  evenLoop (a b : Nat) : Nat × Nat :=
-    if 2 ∣ a
-      then evenLoop (a / 2) ((if 2 ∣ b then b else b + p) / 2)
-      else (a, b)
-
   loop (u v x₁ x₂ : Nat) : Nat :=
          if u = 1 then x₁ % p
     else if v = 1 then x₂ % p
-    else let (u', x₁') := evenLoop u x₁
-         let (v', x₂') := evenLoop v x₂
+    else if u = 0 ∨ v = 0 then 0
+    else let uu := evenLoop p u x₁
+         let vv := evenLoop p v x₂
+         let u' := uu.1; let x₁' := uu.2
+         let v' := vv.1; let x₂' := vv.2
          if u' ≥ v' then loop (u' - v') v' (if x₁' ≥ x₂' then x₁' - x₂' else x₁' + p - x₂') x₂'
                     else loop u' (v' - u') x₁' (if x₂' ≥ x₁' then x₂' - x₁' else x₂' + p - x₁')
+  termination_by u + v
+  decreasing_by
+    all_goals
+      have hu := evenLoop_fst_le p u x₁
+      have hv := evenLoop_fst_le p v x₂
+      omega
 
 def Fq1.add (x y : Fq1) : Fq1 := Fq1.ofNat (x.t + y.t)
 def Fq1.sub (x y : Fq1) : Fq1 := Fq1.ofNat (x.t + fieldPrime - y.t)
@@ -289,7 +307,9 @@ def pointAdd {α} [DecidableEq α] [Field α] : Point α → Point α → Point 
            let y₃    := slope * (x₁ - x₃) - y₁
            .affine x₃ y₃
 
-instance {α} [DecidableEq α] [Field α] : Add (Point α) where
+/-! The four `Point` arithmetic instances below are `@[irreducible]` deliberately. -/
+
+@[irreducible] instance {α} [DecidableEq α] [Field α] : Add (Point α) where
   add := pointAdd
 
 /-- Calculates the additive inverse of a point on the curve. -/
@@ -297,7 +317,7 @@ def pointNegate {α} [Field α] : Point α → Point α
   | .infinity   => .infinity
   | .affine x y => .affine x (-y)
 
-instance {α} [Field α] : Neg (Point α) where
+@[irreducible] instance {α} [Field α] : Neg (Point α) where
   neg := pointNegate
 
 /-- Calculates adding a point to itself `n` times on the curve. -/
@@ -317,10 +337,10 @@ def pointMul {α} [DecidableEq α] [Field α] (scalar : Int) (p : Point α) : Po
   | .ofNat   n => pointBinaryMul .infinity n       p
   | .negSucc n => pointBinaryMul .infinity (n + 1) (-p)
 
-instance {α} [DecidableEq α] [Field α] : HMul Nat (Point α) (Point α) where
+@[irreducible] instance {α} [DecidableEq α] [Field α] : HMul Nat (Point α) (Point α) where
   hMul n := pointMul (.ofNat n)
 
-instance {α} [DecidableEq α] [Field α] : HMul Int (Point α) (Point α) where
+@[irreducible] instance {α} [DecidableEq α] [Field α] : HMul Int (Point α) (Point α) where
   hMul := pointMul
 
 /-- Determines if point `p` is in the subgroup. -/

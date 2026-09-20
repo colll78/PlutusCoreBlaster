@@ -72,6 +72,15 @@ example : (calculatePairing ((12 + 34 + 56) * g1) (78 * g2) |> Option.isSome) = 
 example : calculatePairing ((12 + 34 + 56) * g1) (78 * g2)
           = calculatePairing (78 * g1) ((12 * g2) + (34 * g2)) * calculatePairing (78 * g1) (56 * g2) := by native_decide
 
+/-! `binaryInversion` is a terminating `def`, so these have to hold of its total
+    extension too: it inverts every representative that has an inverse, and hands back
+    `0` — the value it reserves for "no inverse" — for the ones that do not. -/
+
+example : [1, 2, 3, 0xdeadbeef, 2 ^ 380, fieldPrime / 2, fieldPrime - 2, fieldPrime - 1].all
+  (λ a => a * binaryInversion a fieldPrime % fieldPrime == 1) = true := by native_decide
+
+example : (binaryInversion 0 fieldPrime, binaryInversion fieldPrime fieldPrime) = (0, 0) := by native_decide
+
 example : Fq1.sqrtMod 4 = .two 2 4002409555221667393417789825735904156556882819939007885332058136124031650490837864442687629129015664037894272559785 := by native_decide
 
 example : Fq2.sqrtMod 4 = .two 2 (-2) := by native_decide
