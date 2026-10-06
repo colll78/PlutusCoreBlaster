@@ -231,8 +231,16 @@ def runSteps (semanticsVariant : BuiltinSemanticsVariant) (Sigma : State) (n : N
   match n, Sigma with
   | _, State.Halt V => Sigma
   | _, State.Error => Sigma
-  | 0, _ => State.Error -- change to error when num steps exhausted
+  | 0, _ => State.Error -- legacy API conflates exhaustion with script failure
   | Nat.succ n, _ => runSteps semanticsVariant (step semanticsVariant Sigma) n
+
+/-- Assurance execution must distinguish exhausted fuel from script rejection.
+Keep the legacy `runSteps` API for existing callers and its iteration lemmas. -/
+def runStepsPreservingState (semanticsVariant : BuiltinSemanticsVariant) (state : State) (n : Nat) : State :=
+  match n, state with
+  | _, .Halt _ | _, .Error => state
+  | 0, _ => state
+  | n + 1, _ => runStepsPreservingState semanticsVariant (step semanticsVariant state) n
 
 -- Define Apply Params
 def applyParams (body : Term) (params : List Term) : Term :=
@@ -247,7 +255,7 @@ def initialState (t : Term) : State :=
 def cekExecuteProgramWithSemanticVariant (semanticVariant : BuiltinSemanticsVariant) (p : Program) (params : List Term) (n : Nat) : State :=
   match p with
   | Program.Program _ body =>
-      runSteps semanticVariant (initialState (applyParams body params)) n
+      runStepsPreservingState semanticVariant (initialState (applyParams body params)) n
 
 -- Define CEK Execution
 def cekExecuteProgram : Program → List Term →  Nat → State := cekExecuteProgramWithSemanticVariant default
