@@ -2,7 +2,7 @@
   "format": "assurance-workspace-v1",
   "lean": "4.24.0",
   "ghc": "9.6.7",
-  "blasterCommit": "5270d24e2beb0c038bd453ffffb0ad4972176e7e",
+  "blasterCommit": "7a2f4f0547cce56ec3db3f4f39a8b3bb541c85b9",
   "z3Version": "5.1.0",
   "z3SourceBaseline": "ca39e58c525c5b03c2484f118ade2b92fae31215",
   "z3RequiredSimplifier": "recfun-finder",
@@ -13,7 +13,7 @@
   "repositories": {
     "plutus": {
       "repository": "RSoulatIOHK/plutus",
-      "commit": "6616d0162d16c55d22b3c82360afa55c758bc28f"
+      "commit": "411fe6ebb1df8b51e695fe25d934f3cd7b25349e"
     },
     "cips": {
       "repository": "RSoulatIOHK/CIPs",
@@ -25,7 +25,7 @@
     },
     "ledger": {
       "repository": "input-output-hk/CardanoLedgerApiBlaster",
-      "commit": "066e8b64a15f69ac4d8b8c546bcda2c48b36d8d6"
+      "commit": "d4d84987da004f3195789f85322088648b32ee0a"
     }
   }
 }
