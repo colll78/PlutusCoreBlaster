@@ -11,12 +11,12 @@ open PlutusCore.ByteString (ByteString)
 open PlutusCore.Data (Data)
 open PlutusCore.IsData (IsData)
 
--- Import validators from the Acme blueprint that lives in the conformance submodule.
+-- Import validators from the pinned Acme test fixture.
 -- Each validator with a `compiledCode` field produces:
 --   · Acme.<sanitized_title>             : PlutusScript
 --   · Acme.<sanitized_title>_hash        : String
 --   · Acme.<sanitized_title>_paramCount  : Nat  (only when params > 0)
-#import_blueprints Acme ".plutus-conformance/plutus-tx-plugin/test/Blueprint/Acme.golden.json"
+#import_blueprints Acme "PlutusCore/UPLC/BlueprintEncoding/Fixtures/Acme.golden.json"
 
 -- Both validators must be imported as PlutusScript values.
 

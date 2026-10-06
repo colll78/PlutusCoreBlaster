@@ -2,8 +2,8 @@ import PlutusCore.UPLC.BlueprintEncoding.Basic
 import PlutusCore.UPLC.PlutusScript
 
 /-!
-Tests for `#import_blueprints` using real Aiken-compiled blueprints from
-the cardano-ctf repository (../cardano-ctf relative to the project root).
+Tests for `#import_blueprints` using pinned real Aiken-compiled blueprints from
+the cardano-ctf repository.
 
 Each test case exercises a different aspect of the import:
 - hello_world        : single validator, PlutusV2, no parameters
@@ -24,7 +24,7 @@ open PlutusCore.IsData (IsData)
 --   title: "hello_world.hello_world"
 --   sanitized: hello_world_hello_world
 -- ---------------------------------------------------------------------------
-#import_blueprints HelloWorld "../cardano-ctf/00_hello_world/plutus.json"
+#import_blueprints HelloWorld "PlutusCore/UPLC/BlueprintEncoding/Fixtures/ctf-hello-world.json"
 
 -- The namespace identifier is itself a BlueprintInfo value — evaluate it to
 -- get a human-readable summary without printing the raw script bodies.
@@ -69,7 +69,7 @@ open PlutusCore.IsData (IsData)
 --
 -- No parameters are declared, so no _paramCount definition is emitted.
 -- ---------------------------------------------------------------------------
-#import_blueprints TipjarV2 "../cardano-ctf/06_tipjar_v2/plutus.json"
+#import_blueprints TipjarV2 "PlutusCore/UPLC/BlueprintEncoding/Fixtures/ctf-tipjar-v2.json"
 
 /-- info: TipjarV2 : BlueprintInfo -/
 #guard_msgs in
@@ -118,7 +118,7 @@ open PlutusCore.IsData (IsData)
 --   "multisig.multisig"   → multisig_multisig   (no parameters)
 --   "treasury.treasury"   → treasury_treasury   (1 unapplied parameter: multisigHash)
 -- ---------------------------------------------------------------------------
-#import_blueprints MultisigTreasury "../cardano-ctf/03_multisig_treasury/plutus.json"
+#import_blueprints MultisigTreasury "PlutusCore/UPLC/BlueprintEncoding/Fixtures/ctf-multisig-treasury.json"
 
 /-- info: MultisigTreasury : BlueprintInfo -/
 #guard_msgs in
