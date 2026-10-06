@@ -75,6 +75,7 @@ for name in ['RecursiveSchema','NativeEncoding','BooleanCase']:
 testbin=capture(['cabal','list-bin',project,compiler,'plutus-tx:test:plutus-tx-test'],a.plutus)
 run('ual-tests',[testbin,'-p','UAL'],a.plutus/'plutus-tx')
 run('field-tests',[testbin,'-p','field names'],a.plutus/'plutus-tx')
+run('tuple-tests',[testbin,'-p','List product schemas'],a.plutus/'plutus-tx')
 run('definition-tests',[testbin,'-p','PlutusTx.Blueprint.Definition'],a.plutus/'plutus-tx')
 source_inputs = {}
 for label, root, patterns in [
