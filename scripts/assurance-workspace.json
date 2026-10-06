@@ -13,7 +13,7 @@
   "repositories": {
     "plutus": {
       "repository": "RSoulatIOHK/plutus",
-      "commit": "03302b04f801e98386865cd6816dae04b52ca770"
+      "commit": "bf52cc24def6b87b6aad486c5fc624a213b85392"
     },
     "cips": {
       "repository": "RSoulatIOHK/CIPs",
@@ -25,7 +25,7 @@
     },
     "ledger": {
       "repository": "input-output-hk/CardanoLedgerApiBlaster",
-      "commit": "ef6332b47845045aa0c8a1ce96c59f3b4615912a"
+      "commit": "99b519e25a817a9b9671d19094ac229d427b0ef0"
     }
   }
 }
