@@ -36,3 +36,7 @@ run_cmd do
   match Wire.nativeBool true (.I 0), Wire.nativeString "hi" (.I 0), Wire.nativeUnit () (.I 0) with
   | .Halt (.VCon (.Bool true)), .Halt (.VCon (.String "hi")), .Halt (.VCon .Unit) => pure ()
   | _, _, _ => throw (IO.userError "native primitive encoding mismatch")
+
+-- Raw Flat Data artifacts must consume their complete embedded CBOR payload.
+#guard (Applied.decodeValue (.Version 1 0 0) ⟨#[0x4c, 0x01, 0x01, 0x07, 0x00, 0x01]⟩).isOk
+#guard !(Applied.decodeValue (.Version 1 0 0) ⟨#[0x4c, 0x01, 0x02, 0x07, 0x00, 0x00, 0x01]⟩).isOk
