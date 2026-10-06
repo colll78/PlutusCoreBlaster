@@ -9,5 +9,23 @@
   "layout": {
     "blaster": "../Lean-blaster",
     "ledger": "../CardanoLedgerApiBlaster"
+  },
+  "repositories": {
+    "plutus": {
+      "repository": "RSoulatIOHK/plutus",
+      "commit": "03302b04f801e98386865cd6816dae04b52ca770"
+    },
+    "cips": {
+      "repository": "RSoulatIOHK/CIPs",
+      "commit": "d39b5740876bd94967bac7643e2ab9c94c6585d8"
+    },
+    "ual": {
+      "repository": "input-output-hk/UniversalAnnotationLanguage",
+      "commit": "bc6e9c52022b26b288e2a672b3d0309036d7ccc0"
+    },
+    "ledger": {
+      "repository": "input-output-hk/CardanoLedgerApiBlaster",
+      "commit": "ef6332b47845045aa0c8a1ce96c59f3b4615912a"
+    }
   }
 }

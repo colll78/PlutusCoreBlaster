@@ -3,3 +3,8 @@
 import Tests.Basic
 import Tests.BlueprintCodegen.Tests
 import Tests.BlueprintVerify.Tests
+
+-- Self-contained encoding tests; generated Game templates run in compiled-assurance.
+import Tests.BlueprintVerify.NativeEncoding
+import Tests.BlueprintVerify.BooleanCase
+import Tests.BlueprintVerify.RecursiveSchema

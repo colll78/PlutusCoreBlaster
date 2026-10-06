@@ -78,7 +78,7 @@ run('field-tests',[testbin,'-p','field names'],a.plutus/'plutus-tx')
 run('definition-tests',[testbin,'-p','PlutusTx.Blueprint.Definition'],a.plutus/'plutus-tx')
 source_inputs = {}
 for label, root, patterns in [
-    ('core', core, ['PlutusCore/UPLC/BlueprintEncoding/*.lean','PlutusCore/UPLC/BlueprintEncoding/*.schema.json','PlutusCore/UPLC/CekMachine.lean','Tests/BlueprintVerify/*.py','Tests/BlueprintVerify/*.lean','scripts/*assurance*']),
+    ('core', core, ['PlutusCore/UPLC/BlueprintEncoding/*.lean','PlutusCore/UPLC/BlueprintEncoding/*.schema.json','PlutusCore/UPLC/CekMachine.lean','PlutusCore/UPLC/FlatEncoding/*.lean','PlutusCore/UPLC/ScriptEncoding/*.lean','Tests/BlueprintVerify/*.py','Tests/BlueprintVerify/*.lean','scripts/*assurance*']),
     ('ledger', ledger, ['CardanoLedgerApi/Examples/*.lean','Tests/BlueprintVerify/*.py','Tests/BlueprintVerify/*.lean']),
     ('plutus', a.plutus, ['plutus-tx/src/PlutusTx/Assurance/*.hs','plutus-tx/src/PlutusTx/Ual/*.hs','plutus-tx/src/PlutusTx/Blueprint/Definition/*.hs','doc/docusaurus/static/code/Example/Ual/**/*.hs','cabal.assurance.project*','doc/docusaurus/docusaurus-examples.cabal']),
     ('cips', a.cips, ['CIP-XXXX/**/*.json','CIP-XXXX/**/*.md','CIP-XXXX/tests/*.py','CIP-0057/extensions/compiled-interface/**/*.json','CIP-0057/extensions/compiled-interface/**/*.md'])]:
