@@ -54,6 +54,17 @@ def validateValue (defs schema : Json) (term : PlutusCore.UPLC.Term.Term) : Exce
   let .Const value := term | throw "applied parameter must be a closed value in its declared encoding"
   unless (← conforms defs schema value) do throw "applied parameter does not match its value schema"
 
+/-- Upstream's general decoder permits open terms. Parameter artifacts must
+be closed; de Bruijn indices are relative to the current binder depth. -/
+private partial def closed (depth : Nat) : PlutusCore.UPLC.Term.Term → Bool
+  | .Var index => index < depth
+  | .Lam body => closed (depth + 1) body
+  | .Apply fn arg => closed depth fn && closed depth arg
+  | .Delay body | .Force body => closed depth body
+  | .Constr _ fields => fields.all (closed depth)
+  | .Case body branches => closed depth body && branches.all (closed depth)
+  | .Const _ | .Builtin _ | .Error => true
+
 /-- A Flat term artifact has no program-version prefix and no trailing payload. -/
 def decodeValue (version : Version) (bytes : ByteArray) : Except String PlutusCore.UPLC.Term.Term := do
   let raw := String.mk (bytes.toList.map (Char.ofNat ∘ UInt8.toNat))
@@ -61,6 +72,7 @@ def decodeValue (version : Version) (bytes : ByteArray) : Except String PlutusCo
     | throw "invalid Flat parameter bytes"
   let some (rest, term) := FlatEncoding.Internal.decodeTerm version 0 bits
     | throw "invalid or open Flat parameter term"
+  unless closed 0 term do throw "invalid or open Flat parameter term"
   unless FlatEncoding.Internal.unpad rest == some [] do throw "trailing or invalid Flat parameter padding"
   return term
 

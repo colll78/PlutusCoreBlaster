@@ -31,6 +31,8 @@ input_file baseBlueprint where
 
 @[default_target]
 lean_lib «PlutusCore» where
+  precompileModules := true
+  moreLeancArgs := #["-O3"]
   needs := #[assuranceSchema, assuranceV2, checkingContext, interfaceBlueprint, interfaceValue, baseBlueprint]
 
 @[test_driver]
@@ -46,3 +48,11 @@ lean_lib «Cryptograph» where
 lean_exe «gen_conformance_tests» where
   srcDir := "scripts"
   root := `GenConformanceTests
+
+-- `#prep_uplc` benchmark harness (see Benchmark/README.md).
+-- Must not be precompiled: its generated cases import
+-- `PlutusCore.UPLC.ScriptEncoding.Tests`, whose native code would then have to be built.
+lean_lib «Benchmark»
+
+lean_exe «bench_prep_uplc» where
+  root := `Benchmark.PrepUplc.Driver.Main

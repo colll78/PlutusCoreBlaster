@@ -57,7 +57,7 @@ names=['game','parameters','auction','recursive']
 if not a.skip_build:
     run('build-core',['lake','build','Blaster:shared','PlutusCore.UPLC.BlueprintEncoding.Assurance'])
     run('build-ledger',['lake','build','CardanoLedgerApi.Examples.Auction','PlutusCore.UPLC.BlueprintEncoding.Assurance'],ledger)
-    run('build-plutus',['cabal','build',project,compiler,'--enable-tests',*[f'docusaurus-examples:exe:example-ual-{n}' for n in names],'plutus-tx:test:plutus-tx-test'],a.plutus,timeout=7200)
+    run('build-plutus',['cabal','build',project,compiler,*[f'docusaurus-examples:exe:example-ual-{n}' for n in names],'plutus-tx:test:plutus-tx-test'],a.plutus,timeout=7200)
 generators={n:capture(['cabal','list-bin',project,compiler,f'docusaurus-examples:exe:example-ual-{n}'],a.plutus) for n in names}
 base=core/'Tests/BlueprintVerify'
 # Every child captures a fresh matching environment; no historical evidence is reused.
@@ -72,7 +72,7 @@ run('legacy-regressions',['lake','env',sys.executable,base/'regression.py'])
 run('interface-regressions',['lake','env',sys.executable,base/'interface_regression.py',a.output/'game'])
 for name in ['RecursiveSchema','NativeEncoding','BooleanCase']:
     run(name,['lake','env','lean',base/(name+'.lean')])
-testbin=capture(['cabal','list-bin',project,compiler,'--enable-tests','plutus-tx:test:plutus-tx-test'],a.plutus)
+testbin=capture(['cabal','list-bin',project,compiler,'plutus-tx:test:plutus-tx-test'],a.plutus)
 run('ual-tests',[testbin,'-p','UAL'],a.plutus/'plutus-tx')
 run('field-tests',[testbin,'-p','field names'],a.plutus/'plutus-tx')
 run('definition-tests',[testbin,'-p','PlutusTx.Blueprint.Definition'],a.plutus/'plutus-tx')

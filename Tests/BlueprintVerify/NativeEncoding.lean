@@ -9,7 +9,7 @@ open PlutusCore.Data
 -- Return the parameter unchanged after applying the raw runtime context.
 -- Observing the resulting constant tests the wire representation, not only types.
 namespace Wire
-def script : PlutusScript := ⟨.PlutusV3, .Program (.Version 1 0 0) (.Lam "p" (.Lam "ctx" (.Var "p")))⟩
+def script : PlutusScript := ⟨.PlutusV3, .Program (.Version 1 0 0) (.Lam (.Lam (.Var 1)))⟩
 end Wire
 run_cmd do
   for (name, enc, ty) in [

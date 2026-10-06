@@ -7,11 +7,11 @@ open PlutusCore.UPLC.CekMachine
 
 def dispatch (branches : List Term) (b : Bool) : State :=
   step .defaultFunSemanticsVariantE
-    (.Return [.CaseScrutinee branches .EmptyEnvironment] (.VCon (.Bool b)))
+    (.Return [.CaseScrutinee branches []] (.VCon (.Bool b)))
 
 def selected (state : State) (expected : Int) : Prop :=
   match state with
-  | .Eval [] .EmptyEnvironment (.Const (.Integer actual)) => actual = expected
+  | .Eval [] [] (.Const (.Integer actual)) => actual = expected
   | _ => False
 
 def failed (state : State) : Prop :=

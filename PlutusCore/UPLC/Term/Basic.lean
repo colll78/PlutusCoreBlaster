@@ -170,11 +170,15 @@ inductive BuiltinFun
   | DropList
 deriving Repr, BEq
 
+/-- Terms use de Bruijn indices: `Var i` refers to the binder `i` levels out
+    (0 = innermost enclosing `Lam`). An index that reaches past the enclosing
+    binders denotes a free variable, which the CEK machine rejects at
+    evaluation time. The named lambda binder is ignored. -/
 inductive Term
-  | Var : String → Term
+  | Var : Nat → Term
   | Const : Const → Term
   | Builtin : BuiltinFun → Term
-  | Lam : String → Term → Term
+  | Lam : Term → Term
   | Apply : Term → Term → Term
   | Delay : Term → Term
   | Force : Term → Term
