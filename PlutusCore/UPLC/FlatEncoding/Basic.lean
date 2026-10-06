@@ -286,7 +286,7 @@ def varName (debruijn : Nat) : String := s!"dbi_{debruijn}"
 /- Decodes a DeBruijn index and generates a variable name for it. -/
 def decodeVar (nextDebruijn : Nat) (s : List Bool) : Option (List Bool × String) := do
   let (s', n) ← decodeNat s
-  let _       ← Option.filter (λ () => n > 0) (.some ())
+  let _       ← Option.filter (λ () => n > 0 && n ≤ nextDebruijn) (.some ())
   .some (s', varName (nextDebruijn - n))
 
 /- Decodes a UPLC term. -/

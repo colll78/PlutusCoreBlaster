@@ -118,7 +118,7 @@ distinct; runtime inputs stay raw Data so malformed-input claims remain expressi
 Native `#list` and `#pair` bind raw Data elements; any narrower schema-domain
 premises must be explicit in the proposition. A universal metadata label alone is
 not proof of parameter coverage. The current profile rejects Scott encodings,
-applied parameter bindings and ledger-cost checking. Guarded recursive Data
+ledger-cost checking. Guarded recursive Data
 parameters are supported without depth truncation.
 
 Fresh `smt-check` evidence includes `checkingContextHash`. Changing settings makes
@@ -221,10 +221,20 @@ they do not assert termination for every tree depth.
 ## Remaining implementation work
 
 - Scott ABI support and compiler/profile conformance vectors.
-- Applied parameter bindings and applied-script identity checks.
 - Port the complete upstream Auction audit, including expected counterexamples.
 - Establish ledger-valid fixtures for claims intended to cover real transactions.
 - Run the coordinated suite in clean-checkout CI once the local changes are integrated.
 
 Ledger-cost acceptance and helper-to-inlined-code equivalence remain separate
 proof capabilities; the current profile does not claim either.
+
+## Applied parameters
+
+The parameter example checks two universal claims and four specialized-program
+claims. Applied contexts include every ordered Flat term and a digest-bound
+single-CBOR `appliedScript`. The checker validates each value's representation,
+compares the specialized AST with the exact unoptimized template application,
+and verifies its ledger script hash. Its wrapper exposes only runtime inputs.
+Structural Data/native schemas are supported; unsupported refinements fail
+explicitly. Nine negative cases cover missing coverage, order, artifact hashes,
+wrong encodings, unrelated scripts, open terms and trailing bytes.

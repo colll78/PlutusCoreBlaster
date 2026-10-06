@@ -54,7 +54,7 @@ run('unsupported profile',lambda d,b,c,r:c.update(profile='unknown'),'unsupporte
 run('incomplete target coverage',lambda d,b,c,r:c['targets'][0].update(validator='elsewhere'),'exactly cover')
 run('duplicate targets',lambda d,b,c,r:c['targets'].append(copy.deepcopy(c['targets'][0])),'duplicate checking target')
 run('unknown invocation',lambda d,b,c,r:c['targets'][0].update(purpose='mint'),'unknown invocation')
-run('applied parameters',lambda d,b,c,r:c['targets'][0].update(parameters={'mode':'applied','values':[{'parameter':'/parameters/0','term':{'uri':'unused.flat','hash':{'alg':'sha256','digest':'00'*32}}}],'appliedScriptHash':'00'*28}),'applied parameters are unsupported')
+run('applied parameters',lambda d,b,c,r:c['targets'][0].update(parameters={'mode':'applied','values':[{'parameter':'/parameters/0','term':{'uri':'unused.flat','hash':{'alg':'sha256','digest':'00'*32}}}],'appliedScriptHash':'00'*28}),'expected exactly one schema alternative')
 run('missing semantics',lambda d,b,c,r:c['execution'].pop('semanticsVariant'),"missing 'semanticsVariant'")
 run('step exhaustion is not success',lambda d,b,c,r:c['execution']['budget'].update(steps=0),'falsified')
 run('falsified claim',lambda d,b,c,r:d['properties'][0]['statement']['formal'].update(source='∀ (actual guess : ByteString) (ctx : Data), hashMatches actual guess → isUnsuccessful (gameValidator (Data.B actual) (Data.B guess) ctx)'),'falsified')

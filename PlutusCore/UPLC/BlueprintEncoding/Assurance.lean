@@ -4,6 +4,7 @@ import Blaster.Command.Syntax
 import Cryptograph.Sha2
 import PlutusCore.UPLC.BlueprintEncoding.Schema
 import PlutusCore.UPLC.BlueprintEncoding.Basic
+import PlutusCore.UPLC.BlueprintEncoding.Applied
 import PlutusCore.UPLC.Utils
 
 namespace PlutusCore.UPLC.BlueprintEncoding.Assurance
@@ -463,14 +464,56 @@ end Internal
 
 open Internal
 
-/-- Digest-bind a local artifact before interpreting any of its content. -/
-def checkedArtifact (parent : String) (a : ArtifactRef) : IO (String × String) := do
+/-- Digest-bind bytes before interpreting an artifact, including binary Flat terms. -/
+def checkedArtifactBytes (parent : String) (a : ArtifactRef) : IO (String × ByteArray) := do
   if hasRemoteScheme a.uri then throw (IO.userError "remote checking artifacts are unsupported")
   let some h := a.hash | throw (IO.userError "checking artifact requires a digest")
   unless ["sha256", "sha-256"].contains h.alg.toLower do throw (IO.userError "unsupported checking digest algorithm")
   let path := resolveLocalUri parent a.uri
   unless (← sha256File path) == h.digest do throw (IO.userError "checking artifact digest mismatch")
-  return (path, ← IO.FS.readFile path)
+  return (path, ← IO.FS.readBinFile path)
+
+def checkedArtifact (parent : String) (a : ArtifactRef) : IO (String × String) := do
+  let (path, bytes) ← checkedArtifactBytes parent a
+  let some text := String.fromUTF8? bytes | throw (IO.userError "checking document is not UTF-8")
+  return (path, text)
+
+/-- Bind a specialized script to every parameter and the exact template AST.
+The artifact's bytes determine its ledger hash; structural equality prevents a
+different script from being substituted merely by updating that hash. -/
+private def checkApplied (contextPath : String) (bp : Json) (id : String) (params : Json)
+    : CommandElabM String := do
+  let validators ← ofExcept (bp.getObjValAs? (Array Json) "validators")
+  let some v := validators.find? (fun v => getOptStr v "id" == some id)
+    | throwError "unknown applied validator"
+  let version ← ofExcept (getStr (← ofExcept (bp.getObjVal? "preamble")) "plutusVersion")
+  let templateCode ← ofExcept (getStr v "compiledCode")
+  unless (← ofExcept (PlutusCore.UPLC.BlueprintEncoding.Internal.actualScriptHash version templateCode)) == (← ofExcept (getStr v "hash")) do
+    throwError "applied template hash mismatch"
+  let .Program uplcVersion template ← ofExcept (PlutusCore.UPLC.ScriptEncoding.Internal.singleCborEncodedScriptFromHex? templateCode)
+  let slots := (v.getObjValAs? (Array Json) "parameters").toOption.getD #[]
+  let values ← ofExcept (params.getObjValAs? (Array Json) "values")
+  unless values.size == slots.size && !values.isEmpty do throwError "applied parameters must cover every parameter"
+  let defs := (bp.getObjVal? "definitions").toOption.getD (Json.mkObj [])
+  let mut term := template
+  for i in [:values.size] do
+    let value := values[i]!
+    unless getOptStr value "parameter" == some s!"/parameters/{i}" do
+      throwError "applied parameter order/reference mismatch"
+    let ref ← ofExcept (parseArtifact (← ofExcept (value.getObjVal? "term")))
+    let (_, bytes) ← liftM (checkedArtifactBytes contextPath ref)
+    let arg ← ofExcept (Applied.decodeValue uplcVersion bytes)
+    ofExcept (Applied.validateValue defs (← ofExcept (slots[i]!.getObjVal? "schema")) arg)
+    term := .Apply term arg
+  let artifact ← ofExcept (parseArtifact (← ofExcept (params.getObjVal? "appliedScript")))
+  let (_, bytes) ← liftM (checkedArtifactBytes contextPath artifact)
+  let code := Cryptograph.String.uint8ListToHex bytes.toList
+  unless (← ofExcept (PlutusCore.UPLC.BlueprintEncoding.Internal.actualScriptHash version code)) == (← ofExcept (getStr params "appliedScriptHash")) do
+    throwError "applied script hash mismatch"
+  let program ← ofExcept (PlutusCore.UPLC.ScriptEncoding.Internal.singleCborEncodedScriptFromHex? code)
+  unless toExpr program == toExpr (PlutusCore.UPLC.Term.Program.Program uplcVersion term) do
+    throwError "applied script is not the ordered application of the template"
+  return code
 
 private def solverPath : IO String := do
   let r ← IO.Process.output { cmd := "which", args := #["z3"] }
@@ -513,8 +556,8 @@ private def validateCheckingEnvironment (expected : Json) : CommandElabM Unit :=
   unless expected == actual do
     throwError "checking environment does not match loaded modules, Lean, solver or options"
 
-private def loadContext (assurancePath : String) (doc : Document) (p : Property)
-    : CommandElabM (List (String × String × BudgetInfo) × Option Digest × Json) := do
+private def loadContext (assurancePath bpPath : String) (doc : Document) (p : Property)
+    : CommandElabM (List (String × String × BudgetInfo) × Option Digest × Json × List (String × String)) := do
   let some key := p.checkingContext | throwError "compiled-interface checking requires a checkingContext"
   let some artifact := doc.checkingContexts.lookup key | throwError "unknown checking context"
   let (path, content) ← liftM (checkedArtifact assurancePath artifact)
@@ -533,6 +576,8 @@ private def loadContext (assurancePath : String) (doc : Document) (p : Property)
   let targets ← ofExcept (ctx.getObjValAs? (Array Json) "targets")
   let mut ids : List String := []
   let mut selections := []
+  let mut applications := []
+  let bp ← ofExcept (Json.parse (← liftM (IO.FS.readFile bpPath)))
   for t in targets do
     let (id, purpose) ← match getOptStr t "function" with
       | some id => do
@@ -550,7 +595,10 @@ private def loadContext (assurancePath : String) (doc : Document) (p : Property)
         let id ← ofExcept (getStr t "validator")
         let purpose ← ofExcept (getStr t "purpose")
         let params ← ofExcept (t.getObjVal? "parameters")
-        unless getOptStr params "mode" == some "universal" do throwError "applied parameters are unsupported"
+        match getOptStr params "mode" with
+        | some "universal" => pure ()
+        | some "applied" => applications := applications ++ [(id, ← checkApplied path bp id params)]
+        | _ => throwError "unsupported parameter mode"
         pure (id, purpose)
     if ids.contains id then throwError "duplicate checking target"
     ids := id :: ids
@@ -562,7 +610,7 @@ private def loadContext (assurancePath : String) (doc : Document) (p : Property)
   let envRef ← ofExcept (parseArtifact (← ofExcept (ctx.getObjVal? "environment")))
   let (_, envText) ← liftM (checkedArtifact path envRef)
   let manifest ← ofExcept (Json.parse envText)
-  return (selections, artifact.hash, manifest)
+  return (selections, artifact.hash, manifest, applications)
 
 def assuranceOpenDecl : String :=
   openDecl ++ " PlutusCore.UPLC.Utils PlutusCore.UPLC.CekMachine \
@@ -742,8 +790,8 @@ def verifyBlueprintImpl : CommandElab := fun stx => do
                 (v.arguments.getD #[]) v.budget then throwError m!"Property '{p.id}': {why}"
         let fragments ← match fragmentOrder doc.fragments [] f.uses with
           | .ok fs => pure fs | .error e => throwError m!"{e}"
-        let selections ← if blueprint.extended then do
-          let (selected, hash, manifest) ← loadContext assurancePath doc p
+        let (selections, applications) ← if blueprint.extended then do
+          let (selected, hash, manifest, applications) ← loadContext assurancePath bpPath doc p
           if !checkedEnvironments.contains manifest then
             validateCheckingEnvironment manifest
             checkedEnvironments := manifest :: checkedEnvironments
@@ -751,13 +799,13 @@ def verifyBlueprintImpl : CommandElab := fun stx => do
             if let some h := ev.checkingContextHash then
               unless (toJson h.alg, toJson h.digest) == ((toJson (hash.get!).alg), (toJson (hash.get!).digest)) do
                 logWarning m!"Property '{p.id}': historical evidence is stale (checking context changed)"
-          pure selected
-        else pure []
+          pure (selected, applications)
+        else pure ([], [])
         let savedEnv ← getEnv
         let previousErrors := (← get).messages.toList.countP (fun m => m.severity == .error)
         let result ← try
           let scopedBound ← if blueprint.extended then do
-            let imported ← elabBlueprintImport ns bpPath (selections.filter (fun (_, purpose, _) => purpose != "function"))
+            let imported ← elabBlueprintImport ns bpPath (selections.filter (fun (_, purpose, _) => purpose != "function")) applications
             for (id, purpose, budget) in selections do
               if purpose == "function" then
                 let some f := doc.functions.lookup id | throwError "unknown function"

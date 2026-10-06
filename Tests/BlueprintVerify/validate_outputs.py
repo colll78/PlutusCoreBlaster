@@ -62,6 +62,13 @@ def main():
                     assert interface.get('definitions', {}) == doc.get('definitions', {})
                 else:
                     assert target['validator'] in validators
+                    parameters = target['parameters']
+                    if parameters['mode'] == 'applied':
+                        for value in parameters['values']:
+                            artifact(folder, value['term'])
+                        specialized = artifact(folder, parameters['appliedScript'])
+                        tag = bytes([int(bp['preamble']['plutusVersion'][1:])])
+                        assert hashlib.blake2b(tag + specialized.read_bytes(), digest_size=28).hexdigest() == parameters['appliedScriptHash']
         verified = folder / 'verified-assurance.json'
         if verified.exists():
             evidence_doc = load(verified)

@@ -1181,7 +1181,8 @@ syntax (name := import_blueprints) "#import_blueprints" ident str : command
     emit every declaration into namespace `ns`. Returns the parsed blueprint so
     other commands (e.g. `#verify_blueprint`) can inspect it. -/
 def elabBlueprintImport (ns : Name) (filepath : String)
-    (selections : List (String × String × BudgetInfo) := []) : CommandElabM Internal.Blueprint := do
+    (selections : List (String × String × BudgetInfo) := [])
+    (applications : List (String × String) := []) : CommandElabM Internal.Blueprint := do
   let content  ← liftM (IO.FS.readFile (System.FilePath.mk filepath))
   let blueprint ← match parseBlueprint content with
     | .ok b    => pure b
@@ -1192,10 +1193,14 @@ def elabBlueprintImport (ns : Name) (filepath : String)
     let validators ← blueprint.validators.mapM fun v => do
       match selections.find? (fun (id, _, _) => v.id == some id) with
       | none => pure v
-      | some (_, purpose, budget) =>
+      | some (id, purpose, budget) =>
         let some (_, args) := v.invocations.find? (fun i => i.1 == purpose)
           | throwError "checking target selects unknown invocation"
-        pure { v with arguments := some args, budget := some budget }
+        match applications.lookup id with
+        | none => pure { v with arguments := some args, budget := some budget }
+        | some code =>
+          let hash ← ofExcept (actualScriptHash blueprint.preamble.plutusVersion code)
+          pure { v with arguments := some (args.extract v.parameters.size args.size), budget := some budget, compiledCode := some code, hash := some hash, parameters := #[] }
     pure { blueprint with validators }
 
   -- Reject duplicate or colliding generated bindings before adding declarations.
