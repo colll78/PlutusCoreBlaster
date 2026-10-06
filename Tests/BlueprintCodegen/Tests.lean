@@ -2,14 +2,18 @@ import PlutusCore.UPLC.BlueprintEncoding.Basic
 import PlutusCore.UPLC.PlutusScript
 
 /-!
-Regression tests for `#import_blueprints` datum/redeemer type codegen.
-Fixtures carry no `compiledCode`, so only the type/`IsData` generation runs.
+Regression tests for `#import_blueprints` datum/redeemer type codegen and for
+the applied-validator wrapper driven by the `arguments`/`budget` validator
+fields. The type-codegen fixtures carry no `compiledCode`, so only the
+type/`IsData` generation runs for those.
 -/
 
 open PlutusCore.Data (Data)
 open PlutusCore.ByteString (ByteString)
 open PlutusCore.Integer (Integer)
 open PlutusCore.IsData (IsData)
+open PlutusCore.UPLC.Term (Term Const)
+open PlutusCore.UPLC.CekMachine (cekExecuteProgram State)
 
 namespace Tests.BlueprintCodegen
 
@@ -100,5 +104,76 @@ namespace Tests.BlueprintCodegen
 #guard_msgs in
 #eval (IsData.fromData (Data.Constr 0 [Data.Constr 0 [Data.B { data := "a" }, Data.I 9]])
         : Option PairBp.PairDatum)
+
+-- ---------------------------------------------------------------------------
+-- Applied-validator wrappers: the `arguments` + `budget` validator fields.
+--
+-- The fixture has six validators sharing one compiled program:
+--   applied.data      asData Data,                  steps 2500  → wrapper
+--   applied.typed     asData Params + asData Data,   steps 1234  → wrapper
+--   applied.scott     asScott Params,                steps 2500  → skipped
+--   applied.exunits   asData Data,                   exCPU/exMem → skipped
+--   applied.nobudget  asData Data,                   no budget   → skipped
+--   applied.plain     no `arguments` at all                      → unchanged
+-- ---------------------------------------------------------------------------
+/-- warning: Blueprint: validator 'applied.scott' declares 'arguments', but no applied-validator wrapper was emitted: an argument declares encoding 'asScott', and this package has no Scott encoder (there is no `IsScott` class here or in `CardanoLedgerApi`), so the applied term would have to be guessed. 'applied_scott' stays bound to the unapplied PlutusScript.
+---
+warning: Blueprint: validator 'applied.exunits' declares 'arguments', but no applied-validator wrapper was emitted: 'budget' is given as ledger execution units (exCPU 10000000000, exMem 14000000), and there is no conversion from execution units to the CEK step count `cekExecuteProgram` takes. 'applied_exunits' stays bound to the unapplied PlutusScript.
+---
+warning: Blueprint: validator 'applied.nobudget' declares 'arguments', but no applied-validator wrapper was emitted: the validator declares no 'budget', so there is no CEK step count to run with. 'applied_nobudget' stays bound to the unapplied PlutusScript.
+-/
+#guard_msgs in
+#import_blueprints AppliedBp "Tests/BlueprintCodegen/fixtures/applied.json"
+
+-- With `arguments`, the plain name is the wrapper and the script moves to
+-- `_script`; `_hash` keeps the plain prefix.
+
+/-- info: AppliedBp.applied_data (a0 : Data) : State -/
+#guard_msgs in
+#check AppliedBp.applied_data
+
+/-- info: AppliedBp.applied_data_script : PlutusCore.UPLC.PlutusScript.PlutusScript -/
+#guard_msgs in
+#check AppliedBp.applied_data_script
+
+/-- info: AppliedBp.applied_data_hash : String -/
+#guard_msgs in
+#check AppliedBp.applied_data_hash
+
+/-- info: AppliedBp.applied_typed (a0 : AppliedBp.Params) (a1 : Data) : State -/
+#guard_msgs in
+#check AppliedBp.applied_typed
+
+-- Without a usable `arguments`/`budget` pair the plain name stays the
+-- `PlutusScript`, exactly as for a validator that declares neither — no
+-- existing project's `<validator>.script` access is disturbed.
+
+/-- info: AppliedBp.applied_scott : PlutusCore.UPLC.PlutusScript.PlutusScript -/
+#guard_msgs in
+#check AppliedBp.applied_scott
+
+/-- info: AppliedBp.applied_exunits : PlutusCore.UPLC.PlutusScript.PlutusScript -/
+#guard_msgs in
+#check AppliedBp.applied_exunits
+
+/-- info: AppliedBp.applied_nobudget : PlutusCore.UPLC.PlutusScript.PlutusScript -/
+#guard_msgs in
+#check AppliedBp.applied_nobudget
+
+/-- info: AppliedBp.applied_plain : PlutusCore.UPLC.PlutusScript.PlutusScript -/
+#guard_msgs in
+#check AppliedBp.applied_plain
+
+-- The wrapper body is definitionally the term a hand-written CEK property
+-- writes: argument order, the `.script` projection and the step count all pin.
+
+example (d : Data) : AppliedBp.applied_data d
+    = cekExecuteProgram AppliedBp.applied_data_script.script [Term.Const (Const.Data d)] 2500 :=
+  rfl
+
+example (p : AppliedBp.Params) (d : Data) : AppliedBp.applied_typed p d
+    = cekExecuteProgram AppliedBp.applied_typed_script.script
+        [Term.Const (Const.Data (IsData.toData p)), Term.Const (Const.Data d)] 1234 :=
+  rfl
 
 end Tests.BlueprintCodegen

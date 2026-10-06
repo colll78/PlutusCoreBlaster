@@ -4,7 +4,9 @@
     "title": "Placeholder validator assurance",
     "description": "Test-suite fixture: machine-checked claims about the all-todo placeholder validators.",
     "version": "1.0.0",
-    "authors": ["PlutusCoreBlaster test suite"],
+    "authors": [
+      "PlutusCoreBlaster test suite"
+    ],
     "created": "2026-08-12",
     "license": "Apache-2.0"
   },
@@ -35,18 +37,36 @@
       "description": "SMT-based formal verification tool for UPLC validators."
     }
   },
+  "formalFragments": [
+    {
+      "id": "Budget",
+      "language": "lean",
+      "imports": [],
+      "source": "-- The CEK step budget every property in this document runs with.\ndef steps : Nat := 2500"
+    },
+    {
+      "id": "Rejects",
+      "language": "lean",
+      "imports": [
+        "Budget"
+      ],
+      "source": "def withdrawRejects (d : Data) : Prop :=\n  isErrorState (cekExecuteProgram placeholder_placeholder_withdraw.script\n    [Term.Const (Const.Data d)] steps)"
+    }
+  ],
   "properties": [
     {
       "id": "spend-always-rejects",
       "title": "The placeholder spend handler rejects every transaction",
       "scope": {
-        "validators": ["placeholder.placeholder.spend"]
+        "validators": [
+          "placeholder.placeholder.spend"
+        ]
       },
       "statement": {
         "text": "For every script context, executing the compiled spend validator errors (every handler is a `todo`), so no UTxO locked at this script can ever be spent.",
         "formal": {
           "language": "lean",
-          "source": "∀ (d : Data), isErrorState (cekExecuteProgram placeholder_placeholder_spend.script [Term.Const (Const.Data d)] 2500)"
+          "source": "\u2200 (d : Data), isErrorState (cekExecuteProgram placeholder_placeholder_spend.script [Term.Const (Const.Data d)] 2500)"
         }
       },
       "assumptions": [
@@ -54,7 +74,9 @@
           "text": "The CEK execution budget of 2500 steps is sufficient to reach the error."
         }
       ],
-      "tags": ["safety"],
+      "tags": [
+        "safety"
+      ],
       "evidence": [
         {
           "method": "formal-proof",
@@ -77,7 +99,9 @@
       "id": "documented-only",
       "title": "Deployment note",
       "scope": {
-        "validators": ["placeholder.placeholder.mint"]
+        "validators": [
+          "placeholder.placeholder.mint"
+        ]
       },
       "statement": {
         "text": "The mint handler is a placeholder and must be replaced before deployment."
@@ -95,13 +119,18 @@
       "id": "ual-property",
       "title": "A property stated in UAL",
       "scope": {
-        "validators": ["placeholder.placeholder.withdraw"]
+        "validators": [
+          "placeholder.placeholder.withdraw"
+        ]
       },
       "statement": {
         "text": "The withdraw handler rejects every withdrawal.",
         "formal": {
           "language": "ual",
-          "source": "forall ctx. rejects(withdraw, ctx)"
+          "source": "\u2200 (d : Data), withdrawRejects d",
+          "uses": [
+            "Rejects"
+          ]
         }
       }
     },
@@ -109,7 +138,9 @@
       "id": "uri-only",
       "title": "A Lean property only available by URI",
       "scope": {
-        "validators": ["placeholder.placeholder.publish"]
+        "validators": [
+          "placeholder.placeholder.publish"
+        ]
       },
       "statement": {
         "text": "The publish handler rejects every certificate publication.",

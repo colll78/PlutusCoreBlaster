@@ -2,6 +2,7 @@ import Lean
 
 import Blaster.Command.Syntax
 import Cryptograph.Sha2
+import PlutusCore.UPLC.BlueprintEncoding.Schema
 import PlutusCore.UPLC.BlueprintEncoding.Basic
 import PlutusCore.UPLC.Utils
 
@@ -10,46 +11,18 @@ namespace PlutusCore.UPLC.BlueprintEncoding.Assurance
 open Lean Elab Command
 open PlutusCore.UPLC.BlueprintEncoding (elabBlueprintImport)
 open PlutusCore.UPLC.BlueprintEncoding.Internal
-  (getStr getOptStr openDecl parseCommand withTempNamespace BlueprintValidator)
+  (getStr getOptStr openDecl parseCommand parseCommands withTempNamespace BlueprintValidator)
 
-/-! ## CIP-XXXX Plutus Blueprint Assurance documents
+/-! ## Blueprint assurance checking
 
-This module implements the `#verify_blueprint` command, the consumer side of
-the "Plutus Blueprint Assurance Documents" CIP. An assurance document is a
-standalone JSON file making machine-readable claims (properties + evidence)
-about validators described in a CIP-57 blueprint.
-
-```
-#verify_blueprint <Namespace> "path/to/assurance.json"
-#verify_blueprint <Namespace> "path/to/assurance.json" "path/to/plutus.json"
-```
-
-The command:
-1. parses the assurance document;
-2. locates the blueprint — the optional second string overrides
-   `blueprint.uri` (required when the URI is remote; there is no network
-   access at elaboration time). A local URI is resolved relative to the
-   assurance document's directory;
-3. checks the blueprint file against `blueprint.hash` when present (sha256);
-   a mismatch is an error — the claims were made about a different blueprint;
-4. imports the blueprint into `<Namespace>` exactly like
-   `#import_blueprints`;
-5. binds each property's `scope.validators` entries to blueprint validators
-   (by `id`, then by `title`; unknown or ambiguous references are errors) and
-   warns when an evidence `scriptHash` no longer matches the blueprint
-   validator's `hash` (stale claim);
-6. **re-runs every property** whose formal statement is written in Lean:
-   the inline `source` must be a Lean term of type `Prop`, and is handed to
-   `#blaster` with the expected result taken from the recorded `formal-proof`
-   evidence (`verified` → Valid, `falsified` → Falsified). Sources elaborate
-   inside `<Namespace>` with the `PlutusCore` prelude opens
-   (`Data`, `Integer`, `ByteString`, `IsData`, `UPLC.Utils`, `UPLC.CekMachine`,
-   `UPLC.Term`, `UPLC.PlutusScript`), so they can reference the imported
-   validators and generated datum/redeemer types directly;
-7. reports a summary (re-run / skipped counts).
-
-Properties in other formal languages, statements available only by URI, and
-purely natural-language statements are surfaced but not re-run.
+`#verify_blueprint Ns "assurance.json" ["local-plutus.json"]` validates the
+bundled CIP meta-schema and cross-references, checks the blueprint digest and
+actual script hashes, imports generated types/wrappers, and runs Blaster on each
+available Lean/UAL proposition. Historical evidence is reported independently.
+Only def/abbrev fragments are accepted; each proposition gets its declared closure
+in an isolated elaboration environment. Third-party sources still require an OS
+sandbox: Lean elaboration is executable code. Solver success is SMT verification,
+not a reconstructed Lean proof. Unsupported sources are explicitly not checked.
 -/
 
 /-! ### Document model (mirrors the CIP meta-schema) -/
@@ -80,6 +53,24 @@ structure FormalStatement where
   language : String
   source   : Option String
   uri      : Option String
+  /-- Ids of the document's `formalFragments` whose definitions `source`
+      needs in scope. Elaborated, dependencies first, immediately before the
+      statement itself. -/
+  uses     : List String := []
+  deriving Repr, Inhabited
+
+/-- A named, importable block of definitions from the document's top-level
+    `formalFragments` array. Properties pull fragments in by id through their
+    formal statement's `uses` list; fragments pull each other in through
+    `imports`. -/
+structure FormalFragment where
+  id       : String
+  /-- Key into the document's `languages` registry, as for a formal statement. -/
+  language : String
+  /-- Ids of other fragments this one needs in scope. -/
+  imports  : List String
+  /-- The fragment body: a block of Lean commands (typically `def`s). -/
+  source   : String
   deriving Repr, Inhabited
 
 /-- A claim: mandatory natural-language text, optional formal rendering. -/
@@ -108,6 +99,8 @@ structure EvidenceRecord where
   /-- Blake2b-224 hash of the script the verification actually ran against. -/
   scriptHash : Option String
   artifact   : Option ArtifactRef
+  functionHashes : List (String × Digest) := []
+  checkingContextHash : Option Digest := none
   notes      : Option String
   deriving Repr, Inhabited
 
@@ -117,10 +110,12 @@ structure Property where
   title           : Option String
   /-- Validator references (blueprint `id`, falling back to `title`). -/
   scopeValidators : List String
+  scopeFunctions : List String := []
   statement       : Statement
   assumptions     : List Statement
   tags            : List String
   evidence        : Array EvidenceRecord
+  checkingContext : Option String := none
   deriving Repr, Inhabited
 
 /-- A parsed assurance document. -/
@@ -135,8 +130,13 @@ structure Document where
   blueprint   : BlueprintRef
   languages   : List (String × RegistryEntry)
   tools       : List (String × RegistryEntry)
+  /-- Named blocks of definitions properties can import via `formal.uses`. -/
+  fragments   : Array FormalFragment
   properties  : Array Property
-  deriving Repr, Inhabited
+  checkingContexts : List (String × ArtifactRef) := []
+  functions : List (String × Json) := []
+  definitions : Json := Json.mkObj []
+  deriving Inhabited
 
 /-! ### JSON parsing -/
 
@@ -160,12 +160,33 @@ def parseRegistry (j : Lean.Json) (key : String) :
   | .ok _    => .error s!"'{key}' must be an object"
   | .error _ => .ok []
 
+/-- A required array-of-strings field; absent means the empty list, a
+    non-array or a non-string entry is an error. -/
+def getStrList (j : Lean.Json) (key : String) : Except String (List String) :=
+  match j.getObjVal? key with
+  | .ok (.arr a) => a.toList.mapM fun
+      | .str s => .ok s
+      | _      => .error s!"'{key}' entries must be strings"
+  | .ok _        => .error s!"'{key}' must be an array of strings"
+  | .error _     => .ok []
+
 def parseFormal (j : Lean.Json) : Except String FormalStatement := do
   let source := getOptStr j "source"
   let uri    := getOptStr j "uri"
   if source.isNone && uri.isNone then
     throw "formal statement needs 'source' or 'uri'"
-  return { language := ← getStr j "language", source, uri }
+  return { language := ← getStr j "language", source, uri, uses := ← getStrList j "uses" }
+
+def parseFragment (j : Lean.Json) : Except String FormalFragment := do
+  let id ← (getStr j "id").mapError (s!"formal fragment: {·}")
+  let wrap {α} (r : Except String α) : Except String α :=
+    r.mapError (s!"formal fragment '{id}': {·}")
+  return {
+    id
+    language := ← wrap (getStr j "language")
+    imports  := ← wrap (getStrList j "imports")
+    source   := ← wrap (getStr j "source")
+  }
 
 def parseStatement (j : Lean.Json) : Except String Statement := do
   let formal ← match j.getObjVal? "formal" with
@@ -195,7 +216,12 @@ def parseEvidence (j : Lean.Json) : Except String EvidenceRecord := do
     outcome
     date       := ← getStr j "date"
     scriptHash := getOptStr j "scriptHash"
+    functionHashes := ← match j.getObjVal? "functionHashes" with
+      | .ok (.obj o) => o.toList.mapM fun (k, v) => do return (k, ← parseDigest v)
+      | _ => pure []
     artifact
+    checkingContextHash := ← match j.getObjVal? "checkingContextHash" with
+      | .ok h => some <$> parseDigest h | _ => pure none
     notes      := getOptStr j "notes"
   }
 
@@ -204,13 +230,11 @@ def parseProperty (j : Lean.Json) : Except String Property := do
   let scope ← match j.getObjVal? "scope" with
     | .ok s    => pure s
     | .error _ => throw s!"property '{id}': missing 'scope'"
-  let validators ← match scope.getObjVal? "validators" with
-    | .ok (.arr a) => a.toList.mapM fun
-        | .str s => .ok s
-        | _      => .error s!"property '{id}': scope validators must be strings"
-    | _ => throw s!"property '{id}': missing 'scope.validators'"
-  if validators.isEmpty then
-    throw s!"property '{id}': 'scope.validators' must not be empty"
+  let validators ← getStrList scope "validators"
+  let functions ← getStrList scope "functions"
+  if validators.isEmpty && functions.isEmpty then throw "property scope must not be empty"
+  if validators.eraseDups.length != validators.length || functions.eraseDups.length != functions.length then
+    throw "duplicate property scope target"
   let statement ← match j.getObjVal? "statement" with
     | .ok s    => (parseStatement s).mapError (s!"property '{id}': {·}")
     | .error _ => throw s!"property '{id}': missing 'statement'"
@@ -223,12 +247,16 @@ def parseProperty (j : Lean.Json) : Except String Property := do
   let evidence ← match j.getObjVal? "evidence" with
     | .ok (.arr a) => a.mapM (fun e => (parseEvidence e).mapError (s!"property '{id}': {·}"))
     | _            => pure #[]
-  return { id, title := getOptStr j "title", scopeValidators := validators,
-           statement, assumptions, tags, evidence }
+  return { id, title := getOptStr j "title", scopeValidators := validators, scopeFunctions := functions,
+           statement, assumptions, tags, evidence, checkingContext := getOptStr j "checkingContext" }
 
 def parseDocument (s : String) : Except String Document := do
   let json ← Lean.Json.parse s
+  AssuranceSchema.validateDocument json
   let schemaUri ← getStr json "$schema"
+  unless ["https://cips.cardano.org/cips/cipXXXX/schemas/assurance.json",
+          "https://cips.cardano.org/cips/cipXXXX/schemas/assurance-v2.json"].contains schemaUri do
+    throw "unsupported assurance schema"
   let preamble ← match json.getObjVal? "preamble" with
     | .ok p    => pure p
     | .error _ => throw "missing 'preamble'"
@@ -243,6 +271,15 @@ def parseDocument (s : String) : Except String Document := do
     | .error _ => pure none
   let languages ← parseRegistry json "languages"
   let tools ← parseRegistry json "tools"
+  let fragments ← match json.getObjVal? "formalFragments" with
+    | .ok (.arr a) => a.mapM parseFragment
+    | .ok _        => throw "'formalFragments' must be an array"
+    | .error _     => pure #[]
+  -- Fragment ids are the key `formal.uses` and `imports` resolve against.
+  for i in [0 : fragments.size] do
+    for k in [i + 1 : fragments.size] do
+      if fragments[i]!.id == fragments[k]!.id then
+        throw s!"duplicate formal fragment id '{fragments[i]!.id}'"
   let properties ← match json.getObjVal? "properties" with
     | .ok (.arr a) => a.mapM parseProperty
     | .ok _        => throw "'properties' must be an array"
@@ -258,7 +295,15 @@ def parseDocument (s : String) : Except String Document := do
     created     := ← getStr preamble "created"
     license     := getOptStr preamble "license"
     blueprint   := { uri := ← getStr bpJson "uri", hash := bpHash }
-    languages, tools, properties
+    languages, tools, fragments, properties
+    definitions := (json.getObjVal? "definitions").toOption.getD (Json.mkObj [])
+    functions := ← match json.getObjVal? "functions" with
+      | .ok (.obj o) => pure o.toList
+      | .error _ => pure []
+      | _ => throw "functions must be an object"
+    checkingContexts := ← match json.getObjVal? "checkingContexts" with
+      | .ok (.obj o) => o.toList.mapM fun (key, value) => do return (key, ← parseArtifact value)
+      | _ => pure []
   }
 
 /-! ### Blueprint location & binding -/
@@ -297,25 +342,94 @@ give validators unique 'id' fields"
     else
       .error s!"no validator with id or title '{ref}' in the blueprint"
 
-/-- Does the formal statement's language resolve to Lean? The registry entry's
-    `name` decides, falling back to the raw language key. -/
-def isLeanLanguage (doc : Document) (langId : String) : Bool :=
-  let name := ((doc.languages.lookup langId).map (·.name)).getD langId
-  ["lean", "lean4", "lean 4"].contains name.toLower
+/-- Does the formal statement's language resolve to something this command can
+    elaborate? The registry entry's `name` decides, falling back to the raw
+    language key.
 
-/-- The `solve-result` blaster should expect when re-running a property, from
-    its recorded `formal-proof` evidence: `verified` → `0` (Valid),
-    `falsified` → `1`. Claims with only `partial`/`inconclusive` formal-proof
-    evidence are not re-run (`none`). No formal-proof evidence at all means the
-    document asserts the statement outright: expect Valid. -/
-def expectedSolveResult (p : Property) : Option Nat :=
-  match p.evidence.toList.filter (·.method == "formal-proof") with
-  | []      => some 0
-  | ev :: _ =>
-    match ev.outcome with
-    | "verified"  => some 0
-    | "falsified" => some 1
-    | _           => none
+    UAL counts. A UAL property body *is* a Lean `Prop` — UAL's own specification
+    requires it — written against this package's vocabulary and the
+    `CardanoLedgerApi` formalisation. UAL is the annotation envelope (the
+    `{-@ … @-}` blocks and the `ONCHAIN` signature grammar); the formal
+    statement it carries is Lean, so it elaborates here unchanged. -/
+def isLeanLanguage (doc : Document) (langId : String) : Bool := Id.run do
+  let some entry := doc.languages.lookup langId | return false
+  let name := entry.name
+  let n := name.toLower
+  return ["lean", "lean4", "lean 4"].contains n
+    || ["ual", "universal annotation language"].contains n
+
+private def supportedLanguageVersion (entry : RegistryEntry) : Bool :=
+  let ual := ["ual", "universal annotation language"].contains entry.name.toLower
+  (if ual then ["0.4", "0.5", "0.6-draft"] else ["4", "4.24.0"]).contains entry.version
+
+/-! ### Formal fragments -/
+
+/-- Depth-first walk of one fragment id. `st` threads `(handled ids, fragments
+    in elaboration order)`; `onStack` is the current `imports` chain, innermost
+    first, and exists only to catch cycles. -/
+private partial def visitFragment (frags : Array FormalFragment) (onStack : List String)
+    (st : List String × List FormalFragment) (fid : String) :
+    Except String (List String × List FormalFragment) := do
+  if st.1.contains fid then return st
+  if onStack.contains fid then
+    throw s!"formal fragments form an 'imports' cycle: \
+{String.intercalate " → " (onStack.reverse ++ [fid])}"
+  let some fr := frags.find? (·.id == fid)
+    | throw s!"no formal fragment with id '{fid}' in the document's 'formalFragments'"
+  let mut st := st
+  for dep in fr.imports do
+    st ← visitFragment frags (fid :: onStack) st dep
+  return (st.1 ++ [fid], st.2 ++ [fr])
+
+/-- The fragments a property's `uses` list needs, in dependency order.
+
+    `handled` holds the ids already dealt with earlier in this command:
+    `withTempNamespace` restores the scope stack but deliberately keeps the
+    environment, so a fragment's definitions survive into the next property and
+    must be elaborated at most once per `#verify_blueprint`.
+
+    A `uses`/`imports` entry naming no fragment is an error, consistent with how
+    unresolvable validator references are handled; so is an `imports` cycle. -/
+def fragmentOrder (frags : Array FormalFragment) (handled : List String)
+    (uses : List String) : Except String (List FormalFragment) := do
+  let mut st : List String × List FormalFragment := (handled, [])
+  for u in uses do
+    st ← visitFragment frags [] st u
+  return st.2
+
+/-- Checks not expressible by the meta-schema, including unused fragments. -/
+def validateReferences (doc : Document) : Except String Unit := do
+  unless doc.functions.isEmpty || doc.schemaUri.endsWith "assurance-v2.json" do
+    throw "functions require assurance-v2"
+  for p in doc.properties do
+    for id in p.scopeFunctions do
+      unless (doc.functions.lookup id).isSome do throw "unknown scoped function"
+    if let some key := p.checkingContext then
+      unless doc.schemaUri.endsWith "assurance-v2.json" do throw "checking contexts require assurance-v2"
+      unless (doc.checkingContexts.lookup key).isSome do throw "unknown checking context"
+
+  let mut ids : List String := []
+  let checkFormal (f : FormalStatement) : Except String Unit := do
+    unless (doc.languages.lookup f.language).isSome do
+      throw s!"unknown language registry key '{f.language}'"
+    discard <| fragmentOrder doc.fragments [] f.uses
+    for id in f.uses do
+      let some _fr := doc.fragments.find? (·.id == id) | throw s!"unknown fragment '{id}'"
+      pure ()
+  for fr in doc.fragments do
+    unless (doc.languages.lookup fr.language).isSome do throw s!"unknown fragment language '{fr.language}'"
+    discard <| fragmentOrder doc.fragments [] [fr.id]
+    for dep in fr.imports do
+      let some _parent := doc.fragments.find? (·.id == dep) | throw s!"unknown fragment '{dep}'"
+      pure ()
+  for p in doc.properties do
+    if ids.contains p.id then throw s!"duplicate property id '{p.id}'"
+    ids := p.id :: ids
+    for st in p.statement :: p.assumptions do
+      if let some f := st.formal then checkFormal f
+    for ev in p.evidence do
+      if let some tool := ev.tool then
+        unless (doc.tools.lookup tool).isSome do throw s!"unknown tool registry key '{tool}'"
 
 /-! ### Hashing -/
 
@@ -329,13 +443,127 @@ def sha256Hex (bytes : ByteArray) : String :=
   let hashed := Cryptograph.Sha2.Sha256.hashMessage bytes.toList
   String.join (hashed.toList.map toHex8)
 
+/-- File digests are metadata checks, not proof terms. Prefer the platform's
+native SHA-256 utility; the pure implementation remains a portable fallback.
+Arguments are passed directly, never through a shell. Like Z3, these executables
+belong to the trusted, pinned checking environment. -/
+def sha256File (path : System.FilePath) : IO String := do
+  for (cmd, args) in [("sha256sum", #["--", path.toString]),
+                      ("shasum", #["-a", "256", "--", path.toString])] do
+    try
+      let result ← IO.Process.output { cmd, args }
+      let hash := result.stdout.take 64
+      if result.exitCode == 0 && hash.length == 64 &&
+          hash.data.all (fun c => ('0' ≤ c && c ≤ '9') || ('a' ≤ c && c ≤ 'f')) then
+        return hash
+    catch _ => pure ()
+  return sha256Hex (← IO.FS.readBinFile path)
+
 end Internal
 
 open Internal
 
-/-- Namespaces opened around re-run property sources, on top of the code-gen
-    prelude (`openDecl`): everything needed to state CEK-execution properties
-    against the imported validators. -/
+/-- Digest-bind a local artifact before interpreting any of its content. -/
+def checkedArtifact (parent : String) (a : ArtifactRef) : IO (String × String) := do
+  if hasRemoteScheme a.uri then throw (IO.userError "remote checking artifacts are unsupported")
+  let some h := a.hash | throw (IO.userError "checking artifact requires a digest")
+  unless ["sha256", "sha-256"].contains h.alg.toLower do throw (IO.userError "unsupported checking digest algorithm")
+  let path := resolveLocalUri parent a.uri
+  unless (← sha256File path) == h.digest do throw (IO.userError "checking artifact digest mismatch")
+  return (path, ← IO.FS.readFile path)
+
+private def solverPath : IO String := do
+  let r ← IO.Process.output { cmd := "which", args := #["z3"] }
+  unless r.exitCode == 0 do throw (IO.userError "z3 is unavailable")
+  return r.stdout.trim
+
+/-- Pin the actual loaded modules, including the evaluator, crypto model and
+SMT translation, rather than trusting a version label or source checkout. -/
+def captureCheckingEnvironment : CommandElabM Json := do
+  let env ← getEnv
+  let mut modules := []
+  for name in env.header.moduleNames do
+    let path ← liftM (findOLean name)
+    let hash ← liftM (sha256File path)
+    modules := modules ++ [(name.toString, Json.str hash)]
+  let compiler ← liftM IO.appPath
+  let solver ← liftM solverPath
+  -- The runner passes the same configured library to --load-dynlib. Pin its
+  -- actual bytes as well as the .oleans used for reflection and optimization.
+  let native ← match ← liftM (IO.getEnv "ASSURANCE_NATIVE_LIBRARY") with
+    | none => pure []
+    | some path => pure [("nativeBlasterSha256", Json.str (← liftM (sha256File path)))]
+  return Json.mkObj (native ++ [
+    ("format", .str "blaster-loaded-environment-v1"),
+    ("leanVersion", .str Lean.versionString),
+    ("compilerSha256", .str (← liftM (sha256File compiler))),
+    ("solverSha256", .str (← liftM (sha256File solver))),
+    ("solverOptions", Json.mkObj [("timeoutSeconds", toJson (60 : Nat)), ("maxRecDepth", toJson (100000 : Nat)), ("maxHeartbeats", toJson (0 : Nat))]),
+    ("modules", Json.mkObj modules)])
+
+syntax (name := write_checking_environment) "#write_checking_environment" str : command
+@[command_elab write_checking_environment]
+def writeCheckingEnvironment : CommandElab := fun stx => do
+  let some path := stx[1].isStrLit? | throwError "expected environment file"
+  let manifest ← captureCheckingEnvironment
+  liftM (IO.FS.writeFile path (manifest.pretty ++ "\n"))
+
+private def validateCheckingEnvironment (expected : Json) : CommandElabM Unit := do
+  let actual ← captureCheckingEnvironment
+  unless expected == actual do
+    throwError "checking environment does not match loaded modules, Lean, solver or options"
+
+private def loadContext (assurancePath : String) (doc : Document) (p : Property)
+    : CommandElabM (List (String × String × BudgetInfo) × Option Digest × Json) := do
+  let some key := p.checkingContext | throwError "compiled-interface checking requires a checkingContext"
+  let some artifact := doc.checkingContexts.lookup key | throwError "unknown checking context"
+  let (path, content) ← liftM (checkedArtifact assurancePath artifact)
+  let ctx ← match Json.parse content with | .ok x => pure x | .error e => throwError e
+  unless getOptStr ctx "$schema" == some "https://cips.cardano.org/cips/cipXXXX/schemas/checking-context.json" do
+    throwError "unsupported checking-context schema"
+  match AssuranceSchema.validateDocument ctx with | .ok () => pure () | .error e => throwError e
+  unless getOptStr ctx "profile" == some "https://cips.cardano.org/cips/cipXXXX/profiles/uplc-step-check/v1" do
+    throwError "unsupported checking profile"
+  let execution ← ofExcept (ctx.getObjVal? "execution")
+  unless getOptStr execution "acceptance" == some "evaluation" do throwError "ledger-script acceptance is unsupported"
+  let b ← ofExcept (execution.getObjVal? "budget")
+  unless getOptStr b "kind" == some "cek-steps" do throwError "ledger units are unsupported"
+  let steps ← ofExcept (b.getObjValAs? Nat "steps")
+  let sem ← ofExcept (getStr execution "semanticsVariant")
+  let targets ← ofExcept (ctx.getObjValAs? (Array Json) "targets")
+  let mut ids : List String := []
+  let mut selections := []
+  for t in targets do
+    let (id, purpose) ← match getOptStr t "function" with
+      | some id => do
+        let some f := doc.functions.lookup id | throwError "unknown checking function"
+        let h ← ofExcept (t.getObjVal? "functionHash")
+        unless h == (← ofExcept (f.getObjVal? "hash")) do throwError "checking function hash mismatch"
+        let iface ← ofExcept (t.getObjVal? "functionInterface")
+        for key in ["serialization", "plutusVersion", "arguments", "result"] do
+          unless (← ofExcept (iface.getObjVal? key)) == (← ofExcept (f.getObjVal? key)) do
+            throwError "checking function interface mismatch: {key}"
+        unless (iface.getObjVal? "definitions").toOption.getD (Json.mkObj []) == doc.definitions do
+          throwError "checking function definitions mismatch"
+        pure (id, "function")
+      | none => do
+        let id ← ofExcept (getStr t "validator")
+        let purpose ← ofExcept (getStr t "purpose")
+        let params ← ofExcept (t.getObjVal? "parameters")
+        unless getOptStr params "mode" == some "universal" do throwError "applied parameters are unsupported"
+        pure (id, purpose)
+    if ids.contains id then throwError "duplicate checking target"
+    ids := id :: ids
+    selections := selections ++ [(id, purpose, BudgetInfo.semanticSteps steps sem)]
+  let expected := p.scopeValidators ++ p.scopeFunctions
+  unless ids.length == expected.length && ids.all expected.contains &&
+      selections.all (fun (id, purpose, _) => if purpose == "function" then p.scopeFunctions.contains id else p.scopeValidators.contains id) do
+    throwError "checking targets do not exactly cover property scope"
+  let envRef ← ofExcept (parseArtifact (← ofExcept (ctx.getObjVal? "environment")))
+  let (_, envText) ← liftM (checkedArtifact path envRef)
+  let manifest ← ofExcept (Json.parse envText)
+  return (selections, artifact.hash, manifest)
+
 def assuranceOpenDecl : String :=
   openDecl ++ " PlutusCore.UPLC.Utils PlutusCore.UPLC.CekMachine \
 PlutusCore.UPLC.Term PlutusCore.UPLC.PlutusScript"
@@ -344,117 +572,227 @@ PlutusCore.UPLC.Term PlutusCore.UPLC.PlutusScript"
 ### `#verify_blueprint` command
 -/
 
-/-- `#verify_blueprint Ns "assurance.json" ("plutus.json")?` — import the
-blueprint referenced by a CIP blueprint-assurance document into namespace `Ns`
-(like `#import_blueprints`), check the binding chain (blueprint hash, validator
-references, evidence script hashes), and re-run every property whose formal
-statement is inline Lean by handing it to `#blaster`. The optional second path
-overrides the document's `blueprint.uri` (required when that URI is remote). -/
+/-- Third-party source must still be executed in an OS sandbox. This restriction
+keeps fragments definitional and prevents accidental axioms/options/commands. -/
+private def checkFragmentCommand (stx : Syntax) : CommandElabM Unit := do
+  unless stx.getKind == ``Lean.Parser.Command.declaration do
+    throwError "formal fragments may contain only def/abbrev declarations"
+  let decl := stx[1]
+  unless decl.getKind == ``Lean.Parser.Command.definition || decl.getKind == ``Lean.Parser.Command.abbrev do
+    throwError "formal fragments may contain only def/abbrev declarations"
+
+/-- Follow local definitions before simplification to detect disconnected claims.
+This is a dependency check, not a proof of semantic relevance. -/
+private partial def dependencies (env : Environment) (todo : List Name)
+    (seen : NameSet := {}) : NameSet :=
+  match todo with
+  | [] => seen
+  | n :: rest =>
+    if seen.contains n then dependencies env rest seen
+    else
+      let next := match env.find? n with
+        | some (.defnInfo info) =>
+            if env.isImportedConst n then [] else info.value.getUsedConstants.toList
+        | _ => []
+      dependencies env (next ++ rest) (seen.insert n)
+
+private def checkSource (ns : Name) (validators : List BlueprintValidator)
+    (functions : List String) (src : String) : CommandElabM Blaster.Smt.Result := do
+  let env ← getEnv
+  let stx ← match Parser.runParserCategory env `term src with
+    | .ok stx => pure stx
+    | .error e => throwError m!"Invalid formal proposition: {e}"
+  liftTermElabM do
+    let expr ← instantiateMVars (← Term.elabTermAndSynthesize stx (some (mkSort .zero)))
+    if expr.hasSorry then throwError "formal proposition contains sorry"
+    let used := dependencies (← getEnv) expr.getUsedConstants.toList
+    for v in validators do
+      let title := PlutusCore.UPLC.BlueprintEncoding.Internal.sanitizeName v.title
+      let raw := if v.arguments.isSome && (PlutusCore.UPLC.BlueprintEncoding.Internal.wrapperBlocker
+                       (v.arguments.getD #[]) v.budget).isNone then title ++ "_script" else title
+      unless used.contains (Name.mkStr ns raw) do
+        throwError m!"formal proposition does not depend on scoped validator '{v.id.getD v.title}'"
+    for id in functions do
+      let raw := PlutusCore.UPLC.BlueprintEncoding.Internal.sanitizeName id ++ "_script"
+      unless used.contains (Name.mkStr ns raw) do
+        throwError "formal proposition does not depend on scoped function '{id}'"
+    unless (← Blaster.Optimize.findLocalAxioms).isEmpty do
+      throwError "assurance checking does not accept local axioms"
+    for n in expr.getUsedConstants do
+      let axioms ← Lean.collectAxioms n
+      if axioms.contains ``sorryAx || axioms.contains `Blaster.Tactic.blasterProven then
+        throwError m!"formal proposition depends on an admitted declaration: {n}"
+    let solver := {(default : Blaster.Optimize.TranslateEnv) with
+      optEnv.options.solverOptions := ({ timeout := some 60 } : Blaster.Options.BlasterOptions)}
+    let ((result, _), _) ←
+      withTheReader Core.Context (fun c => { c with maxHeartbeats := 0, maxRecDepth := 100000 }) do
+        Blaster.Smt.Translate.main expr |>.run solver
+    return result
+
 syntax (name := verify_blueprint) "#verify_blueprint" ident str (str)? : command
 
 @[command_elab verify_blueprint]
 def verifyBlueprintImpl : CommandElab := fun stx => do
-  let nsIdent := stx[1]
-  let pathLit := stx[2]
-  let some assurancePath := pathLit.isStrLit?
-    | throwErrorAt pathLit "string literal expected"
-  let overridePath : Option String :=
-    if stx[3].getNumArgs == 0 then none else stx[3][0].isStrLit?
-  let ns := nsIdent.getId
-
-  -- 1. Parse the assurance document.
+  let some assurancePath := stx[2].isStrLit? | throwError "string literal expected"
+  let overridePath := if stx[3].getNumArgs == 0 then none else stx[3][0].isStrLit?
+  let ns := stx[1].getId
   let content ← liftM (IO.FS.readFile (System.FilePath.mk assurancePath))
   let doc ← match parseDocument content with
-    | .ok d    => pure d
-    | .error e => throwError s!"Failed to parse assurance document '{assurancePath}': {e}"
-
-  -- 2. Locate the blueprint.
+    | .ok d => pure d | .error e => throwError m!"Invalid assurance document: {e}"
+  match validateReferences doc with
+  | .ok () => pure () | .error e => throwError m!"Invalid assurance references: {e}"
   let bpPath ← match overridePath with
     | some p => pure p
     | none =>
       if hasRemoteScheme doc.blueprint.uri then
-        throwError s!"Assurance document references a remote blueprint \
-('{doc.blueprint.uri}'); pass a local copy as a second argument: \
-#verify_blueprint {ns} \"{assurancePath}\" \"path/to/plutus.json\""
-      else
-        pure (resolveLocalUri assurancePath doc.blueprint.uri)
-
-  -- 3. Tamper check against the declared blueprint hash.
+        throwError "Remote blueprint requires an explicit local copy"
+      pure (resolveLocalUri assurancePath doc.blueprint.uri)
   if let some dig := doc.blueprint.hash then
-    let alg := dig.alg.toLower
-    if alg == "sha256" || alg == "sha-256" then
-      let bytes ← liftM (IO.FS.readBinFile (System.FilePath.mk bpPath))
-      let actual := sha256Hex bytes
-      if actual != dig.digest.toLower then
-        throwError s!"Blueprint hash mismatch: assurance document was written \
-against sha256 {dig.digest}, but '{bpPath}' hashes to {actual}. The claims may \
-not apply to this blueprint."
-    else
-      logWarning s!"Blueprint hash algorithm '{dig.alg}' is not supported; \
-tamper check skipped."
-
-  -- 4. Import the blueprint (same effect as #import_blueprints).
-  let blueprint ← elabBlueprintImport ns bpPath
-
-  -- 5./6. Per-property checks and re-runs.
-  let mut reran           := 0
-  let mut skippedInformal := 0
-  let mut skippedLang     := 0
-  let mut skippedUri      := 0
-  let mut skippedOutcome  := 0
-
+    unless ["sha256", "sha-256"].contains dig.alg.toLower do
+      throwError m!"Unsupported blueprint digest algorithm '{dig.alg}': binding is unverified"
+    let actual ← liftM (sha256File (System.FilePath.mk bpPath))
+    unless actual == dig.digest do throwError m!"Blueprint hash mismatch: expected {dig.digest}, computed {actual}"
+  else
+    logWarning "Blueprint document binding is unverified (no blueprint.hash)"
+  let parsed ← ofExcept (PlutusCore.UPLC.BlueprintEncoding.Internal.parseBlueprint (← liftM (IO.FS.readFile bpPath)))
+  if parsed.extended && doc.blueprint.hash.isNone then throwError "compiled-interface checking requires a blueprint digest"
+  if parsed.extended && !doc.schemaUri.endsWith "assurance-v2.json" then
+    throwError "compiled-interface checking requires assurance-v2"
+  for (id, f) in doc.functions do
+    if parsed.validators.any (fun v => v.id == some id) then throwError "function/validator id collision"
+    let code ← ofExcept (getStr f "compiledCode")
+    let some chars := PlutusCore.UPLC.ScriptEncoding.Internal.hexStringToString code.data []
+      | throwError "invalid function compiledCode"
+    let hash ← ofExcept (parseDigest (← ofExcept (f.getObjVal? "hash")))
+    unless hash.alg == "sha256" do throwError "unsupported function digest algorithm"
+    let bytes := ByteArray.mk (chars.map (fun c => UInt8.ofNat c.toNat)).toArray
+    unless sha256Hex bytes == hash.digest do throwError "function compiledCode hash mismatch"
+    unless getOptStr f "serialization" == some "cbor-flat" do throwError "unsupported function serialization"
+    discard <| ofExcept (PlutusCore.UPLC.ScriptEncoding.Internal.singleCborEncodedScriptFromHex? code)
+    for arg in ← ofExcept (f.getObjValAs? (Array Json) "arguments") do
+      discard <| ofExcept (PlutusCore.UPLC.BlueprintEncoding.Internal.parseFunctionWire arg doc.definitions)
+    discard <| ofExcept (PlutusCore.UPLC.BlueprintEncoding.Internal.parseFunctionWire (← ofExcept (f.getObjVal? "result")) doc.definitions)
+  let blueprint ← if parsed.extended then pure parsed else elabBlueprintImport ns bpPath
+  let mut checkedEnvironments : List Json := []
+  let mut checked := 0
+  let mut skipped := 0
+  let mut failed := 0
+  -- Each property gets only its declared fragment closure. Definitions from one
+  -- property cannot accidentally satisfy undeclared dependencies of the next.
   for p in doc.properties do
-    -- Bind scope references to blueprint validators.
-    let mut boundValidators : List BlueprintValidator := []
+    let mut bound : List BlueprintValidator := []
     for ref in p.scopeValidators do
-      match resolveValidator blueprint.validators ref with
-      | .ok v    => boundValidators := boundValidators ++ [v]
-      | .error e => throwError s!"Property '{p.id}': {e}"
-    -- Stale-claim detection: evidence scriptHash vs blueprint validator hash.
+      let v ← match resolveValidator blueprint.validators ref with
+        | .ok v => pure v | .error e => throwError m!"Property '{p.id}': {e}"
+      if v.compiledCode.isNone then throwError m!"Property '{p.id}': scoped validator has no compiledCode"
+      bound := bound ++ [v]
+    -- Historical evidence is reported separately. It never determines a fresh verdict.
     for ev in p.evidence do
-      if let some sh := ev.scriptHash then
-        for v in boundValidators do
-          if let some h := v.hash then
-            if h.toLower != sh.toLower then
-              logWarning s!"Property '{p.id}': evidence ({ev.method}, {ev.date}) \
-was produced against script hash {sh}, but blueprint validator '{v.title}' now \
-has hash {h} — the claim may be stale."
-    -- Re-run the formal statement, if we can.
+      for id in p.scopeFunctions do
+        let some f := doc.functions.lookup id | throwError "unknown scoped function"
+        let expected ← ofExcept (parseDigest (← ofExcept (f.getObjVal? "hash")))
+        match ev.functionHashes.lookup id with
+        | none => logWarning "historical evidence is unverifiable (missing function hash)"
+        | some h => unless h.alg == expected.alg && h.digest == expected.digest do
+            logWarning "historical evidence is stale (function changed)"
+      for v in bound do
+        if let some sh := ev.scriptHash then
+          match v.hash with
+          | none => logWarning m!"Property '{p.id}': historical evidence is unverifiable (missing script hash)"
+          | some h => if h != sh then logWarning m!"Property '{p.id}': historical evidence is stale"
+      if let some artifact := ev.artifact then
+        if hasRemoteScheme artifact.uri then
+          logWarning m!"Property '{p.id}': historical artifact not checked (remote URI); fresh checking is independent"
+        else
+          let some digest := artifact.hash | throwError "Artifact digest is required"
+          unless ["sha256", "sha-256"].contains digest.alg.toLower do
+            throwError m!"Unsupported artifact digest algorithm '{digest.alg}'"
+          let path := resolveLocalUri assurancePath artifact.uri
+          let actual ← liftM (sha256File (System.FilePath.mk path))
+          unless actual == digest.digest do throwError m!"Property '{p.id}': artifact digest mismatch"
     match p.statement.formal with
     | none =>
-      logInfo s!"Property '{p.id}': natural-language statement only; not re-run."
-      skippedInformal := skippedInformal + 1
+      logInfo m!"Property '{p.id}': not checked (natural-language only)"
+      skipped := skipped + 1
     | some f =>
       if !isLeanLanguage doc f.language then
-        logWarning s!"Property '{p.id}': formal language '{f.language}' is not \
-supported for re-verification; skipped."
-        skippedLang := skippedLang + 1
-      else match f.source with
-      | none =>
-        logWarning s!"Property '{p.id}': formal statement is only available by \
-URI ({f.uri.getD "<missing>"}); inline 'source' is required for re-verification; \
-skipped."
-        skippedUri := skippedUri + 1
-      | some src =>
-        match expectedSolveResult p with
-        | none =>
-          logInfo s!"Property '{p.id}': recorded formal-proof outcome is \
-partial/inconclusive; not re-run."
-          skippedOutcome := skippedOutcome + 1
-        | some n =>
-          logInfo s!"Property '{p.id}': re-running with blaster \
-(expecting {if n == 0 then "Valid" else "Falsified"})."
+        logWarning m!"Property '{p.id}': not checked (unsupported language '{f.language}')"
+        skipped := skipped + 1
+      else
+        let entry := (doc.languages.lookup f.language).get!
+        let ual := ["ual", "universal annotation language"].contains entry.name.toLower
+        unless supportedLanguageVersion entry do
+          throwError m!"Unsupported formal-language version '{entry.version}'"
+        let some src := f.source | do
+          logWarning m!"Property '{p.id}': not checked (formal source is only available by URI)"
+          skipped := skipped + 1
+          continue
+        if blueprint.extended then
+          unless ual && entry.version == "0.6-draft" do throwError "compiled-interface checking requires UAL 0.6-draft"
+        else if p.checkingContext.isSome || (ual && entry.version == "0.6-draft") then
+          throwError "checking context requires compiled-interface blueprint"
+        if ual && entry.version == "0.5" then
+          for v in bound do
+            if v.id.isNone then throwError "UAL 0.5 requires stable validator ids"
+            match v.budget with
+            | some (.semanticSteps ..) => pure ()
+            | _ => throwError "UAL 0.5 requires an explicit steps budget and semantics variant"
+            if v.arguments.isNone then throwError "UAL 0.5 requires an explicit arguments list"
+            if let some why := PlutusCore.UPLC.BlueprintEncoding.Internal.wrapperBlocker
+                (v.arguments.getD #[]) v.budget then throwError m!"Property '{p.id}': {why}"
+        let fragments ← match fragmentOrder doc.fragments [] f.uses with
+          | .ok fs => pure fs | .error e => throwError m!"{e}"
+        let selections ← if blueprint.extended then do
+          let (selected, hash, manifest) ← loadContext assurancePath doc p
+          if !checkedEnvironments.contains manifest then
+            validateCheckingEnvironment manifest
+            checkedEnvironments := manifest :: checkedEnvironments
+          for ev in p.evidence do
+            if let some h := ev.checkingContextHash then
+              unless (toJson h.alg, toJson h.digest) == ((toJson (hash.get!).alg), (toJson (hash.get!).digest)) do
+                logWarning m!"Property '{p.id}': historical evidence is stale (checking context changed)"
+          pure selected
+        else pure []
+        let savedEnv ← getEnv
+        let previousErrors := (← get).messages.toList.countP (fun m => m.severity == .error)
+        let result ← try
+          let scopedBound ← if blueprint.extended then do
+            let imported ← elabBlueprintImport ns bpPath (selections.filter (fun (_, purpose, _) => purpose != "function"))
+            for (id, purpose, budget) in selections do
+              if purpose == "function" then
+                let some f := doc.functions.lookup id | throwError "unknown function"
+                let args ← (← ofExcept (f.getObjValAs? (Array Json) "arguments")).mapM fun a =>
+                  ofExcept (PlutusCore.UPLC.BlueprintEncoding.Internal.parseFunctionWire a doc.definitions)
+                let result ← ofExcept (PlutusCore.UPLC.BlueprintEncoding.Internal.parseFunctionWire (← ofExcept (f.getObjVal? "result")) doc.definitions)
+                let .semanticSteps steps sem := budget | throwError "function requires semantic steps"
+                PlutusCore.UPLC.BlueprintEncoding.Internal.emitAssuranceFunction ns id
+                  (← ofExcept (getStr f "compiledCode")) (← ofExcept (getStr f "plutusVersion")) args result steps sem
+            p.scopeValidators.mapM fun ref => ofExcept (resolveValidator imported.validators ref)
+          else pure bound
           withTempNamespace ns do
             elabCommand (← parseCommand assuranceOpenDecl)
-            elabCommand (← parseCommand s!"#blaster (solve-result: {n}) [ {src} ]")
-          reran := reran + 1
-
-  -- 7. Summary.
-  let skipped := skippedInformal + skippedLang + skippedUri + skippedOutcome
-  let plural := if doc.properties.size == 1 then "property" else "properties"
-  logInfo s!"Assurance document '{doc.title}': {doc.properties.size} {plural} \
-— {reran} re-run with blaster, {skipped} not re-run \
-({skippedInformal} natural-language only, {skippedLang} unsupported language, \
-{skippedUri} source by URI, {skippedOutcome} partial/inconclusive)."
+            for fr in fragments do
+              unless isLeanLanguage doc fr.language do throwError "Unsupported fragment language"
+              unless supportedLanguageVersion ((doc.languages.lookup fr.language).get!) do
+                throwError "Unsupported fragment language version"
+              for command in ← parseCommands s!"formal fragment '{fr.id}'" fr.source do
+                checkFragmentCommand command
+                elabCommand command
+            logInfo m!"Property '{p.id}': checking fresh proposition"
+            if (← get).messages.toList.countP (fun m => m.severity == .error) > previousErrors then
+              throwError "generated interface or formal fragments failed to elaborate"
+            checkSource ns scopedBound p.scopeFunctions src
+        finally
+          setEnv savedEnv
+        checked := checked + 1
+        match result with
+        | .Valid => logInfo m!"Property '{p.id}': verified (Blaster SMT; no reconstructed Lean proof)"
+        | .Falsified _ =>
+          logError m!"Property '{p.id}': falsified"
+          failed := failed + 1
+        | .Undetermined =>
+          logError m!"Property '{p.id}': inconclusive"
+          failed := failed + 1
+  logInfo m!"Assurance '{doc.title}': {checked} checked, {skipped} not checked, {failed} failed/inconclusive"
 
 end PlutusCore.UPLC.BlueprintEncoding.Assurance

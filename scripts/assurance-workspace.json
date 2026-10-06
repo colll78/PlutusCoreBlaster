@@ -1,0 +1,10 @@
+{
+  "format": "assurance-workspace-v1",
+  "lean": "4.24.0",
+  "ghc": "9.6.7",
+  "blasterCommit": "707c78a9c92bfb95cf76ce0cd10fad3a5c535613",
+  "z3Version": "5.1.0",
+  "z3SourceBaseline": "ca39e58c525c5b03c2484f118ade2b92fae31215",
+  "z3RequiredSimplifier": "recfun-finder",
+  "layout": {"blaster": "../Lean-blaster", "ledger": "../CardanoLedgerApiBlaster"}
+}

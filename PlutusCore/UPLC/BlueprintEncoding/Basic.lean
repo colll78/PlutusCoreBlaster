@@ -1,6 +1,9 @@
 import Lean
+import Cryptograph.Blake2b
+import PlutusCore.UPLC.BlueprintEncoding.Schema
 
 import PlutusCore.IsData
+import PlutusCore.UPLC.CekMachine
 import PlutusCore.UPLC.PlutusScript
 import PlutusCore.UPLC.ScriptEncoding.Basic
 import PlutusCore.UPLC.Term
@@ -26,6 +29,37 @@ For each validator it produces:
   together with `IsData` instances, when the schema can be expressed in terms
   of the built-in Plutus types.
 - `<ns> : BlueprintInfo`  — human-readable summary of the whole blueprint.
+
+### Coordinated compiled-interface dialect
+
+The draft dialect carries ordered interface references and schema-defined parameter
+representations. Importing it alone emits raw scripts. Assurance checking supplies
+the selected purpose and execution settings separately, generating each property's
+wrappers in an isolated environment. Runtime binders stay raw Data.
+
+### Legacy applied-validator wrappers
+
+CIP-57 splits a validator's inputs into `parameters` / `datum` / `redeemer` and
+leaves the script context implicit, so it cannot say *what the compiled program
+is actually applied to*. Two additional (legal, optional) validator fields close
+that gap:
+
+```json
+"arguments": [ { "encoding": "asData", "schema": { "$ref": "…" } }, … ],
+"budget":    { "steps": 2500 }
+```
+
+`arguments` is the ordered list of terms the program is applied to; `budget`
+gives the CEK step count to run for. When both are present *and* usable, the
+`PlutusScript` is emitted as `<ns>.<title>_script` and the plain
+`<ns>.<title>` becomes a wrapper that encodes its Lean arguments and runs the
+CEK machine, so properties can be stated as `<title> a₀ a₁ … : State`.
+
+The rename is **conditional**: a validator without `arguments` (every Aiken
+blueprint) keeps `<ns>.<title> : PlutusScript` unchanged, and so does a
+validator whose `arguments`/`budget` cannot be honoured (see
+`Internal.wrapperBlocker`). `_hash` and `_paramCount` always keep the plain
+`<title>` prefix.
 -/
 
 /-! ### Public summary types -/
@@ -60,6 +94,38 @@ structure SchemaInfo where
   typeName : Option String
   /-- Fully-resolved Plutus type. -/
   ptype    : PlutusType
+  deriving Repr, Inhabited
+
+/-- How one applied argument is encoded before the compiled program is applied
+    to it (the `encoding` field of a validator `arguments` entry). -/
+inductive ArgEncoding where
+  /-- The argument is passed as a `Data` constant — i.e. `IsData.toData`
+      wrapped in `Term.Const (Const.Data …)`. -/
+  | asData             : ArgEncoding
+  | asNative (kind : String) : ArgEncoding
+  /-- The argument is Scott-encoded. There is no Scott encoder in this package
+      (nor in `CardanoLedgerApi`), so no wrapper is emitted for it. -/
+  | asScott            : ArgEncoding
+  /-- Any other `encoding` keyword; unknown to this importer. -/
+  | other (name : String) : ArgEncoding
+  deriving Repr, Inhabited, BEq
+
+/-- One entry of a validator's `arguments` array: the encoding, plus the
+    argument's Plutus type resolved through the blueprint `definitions`. -/
+structure ArgumentInfo where
+  encoding : ArgEncoding
+  ptype    : PlutusType
+  deriving Repr, Inhabited
+
+/-- A validator's declared execution budget. CIP-57 does not define this field;
+    the two shapes below are what the emitting pipelines produce. -/
+inductive BudgetInfo where
+  /-- A CEK step count — directly usable as `cekExecuteProgram`'s third argument. -/
+  | steps   (n : Nat)          : BudgetInfo
+  | semanticSteps (n : Nat) (semantics : String) : BudgetInfo
+  /-- Ledger execution units. There is no conversion from these to a step
+      count, so no wrapper is emitted for a validator budgeted this way. -/
+  | exUnits (exCPU exMem : Nat) : BudgetInfo
   deriving Repr, Inhabited
 
 /-- Metadata for one validator entry in a CIP-57 blueprint. -/
@@ -107,8 +173,17 @@ structure BlueprintValidator where
   datum        : Option SchemaInfo
   redeemer     : Option SchemaInfo
   parameters   : Array SchemaInfo
+  /-- The ordered list of terms the compiled program is applied to, when the
+      blueprint declares it. `none` means the field is absent (the CIP-57
+      baseline) — no applied-validator wrapper is emitted and the plain
+      validator name stays bound to the `PlutusScript`. -/
+  arguments    : Option (Array ArgumentInfo) := none
+  /-- The declared execution budget, when present. -/
+  budget       : Option BudgetInfo := none
+  invocations  : Array (String × Array ArgumentInfo) := #[]
 
 structure Blueprint where
+  extended   : Bool := false
   preamble   : BlueprintPreamble
   validators : Array BlueprintValidator
   /-- Every nameable definition (record / enum / sum-of-products), as
@@ -201,12 +276,12 @@ private partial def parseSchemaType (defs : Lean.Json) (j : Lean.Json) (depth : 
   | .ok (.str dt) =>
     match dt with
     | "#integer" | "integer" => .integer
-    | "#bytestring" | "bytestring" | "bytes" => .bytestring
+    | "#bytes" | "#bytestring" | "bytestring" | "bytes" => .bytestring
     | "#string"    => .string
     | "#boolean"   => .bool
     | "#unit"      => .unit
     | "#void"      => .void
-    | "list" =>
+    | "#list" | "list" =>
       let items := match j.getObjVal? "items" with
         | .ok i => parseSchemaType defs i (depth - 1)
         | _     => .data
@@ -215,7 +290,7 @@ private partial def parseSchemaType (defs : Lean.Json) (j : Lean.Json) (depth : 
       let keys   := match j.getObjVal? "keys"   with | .ok k => parseSchemaType defs k (depth-1) | _ => .data
       let values := match j.getObjVal? "values" with | .ok v => parseSchemaType defs v (depth-1) | _ => .data
       .map keys values
-    | "pair" =>
+    | "#pair" | "pair" =>
       let left  := match j.getObjVal? "left"  with | .ok l => parseSchemaType defs l (depth-1) | _ => .data
       let right := match j.getObjVal? "right" with | .ok r => parseSchemaType defs r (depth-1) | _ => .data
       .pair left right
@@ -272,14 +347,228 @@ private def parsePreamble (j : Lean.Json) : Except String BlueprintPreamble := d
     license       := getOptStr j "license"
   }
 
-private def parseValidator (defs : Lean.Json) (j : Lean.Json) : Except String BlueprintValidator := do
+private def parseArgEncoding : String → ArgEncoding
+  | "asData"  => .asData
+  | "asScott" => .asScott
+  | name      => .other name
+
+/-- Validate references before type lowering can turn unresolved schemas into Data.
+Recursive schemas must be guarded by a constructor or container. -/
+private partial def validateArgumentSchema (defs j : Lean.Json) (seen : List (String × Nat) := []) (depth : Nat := 0) : Except String Unit := do
+  match j with
+  | .obj fields =>
+    if (j.getObjVal? "allOf").isOk || (j.getObjVal? "not").isOk then
+      throw "argument schema uses unsupported composition"
+    if let .ok dtJson := j.getObjVal? "dataType" then
+      let .str dt := dtJson | throw "argument dataType must be a string"
+      unless ["integer", "#integer", "bytestring", "#bytestring", "bytes", "#string",
+              "#boolean", "#unit", "#void", "#bytes", "#list", "#pair", "list", "map", "pair", "constructor"].contains dt do
+        throw s!"unsupported argument dataType '{dt}'"
+    if let .ok refJson := j.getObjVal? "$ref" then
+      let .str ref := refJson | throw "argument $ref must be a string"
+      unless ref.startsWith "#/definitions/" do throw "argument $ref must reference local definitions"
+      let key := decodeJsonPointer (ref.drop "#/definitions/".length)
+      let target ← (defs.getObjVal? key).mapError (fun _ => s!"unresolved argument schema '{key}'")
+      if let some prior := seen.lookup key then
+        unless depth > prior do throw s!"unguarded recursive argument schema '{key}'"
+      else validateArgumentSchema defs target ((key, depth) :: seen) depth
+    for (key, value) in fields.toArray do
+      if ["items", "keys", "values", "left", "right", "schema"].contains key then
+        validateArgumentSchema defs value seen (depth + if ["items", "keys", "values", "left", "right"].contains key then 1 else 0)
+      if ["fields", "anyOf", "oneOf", "allOf"].contains key then
+        let .arr values := value | throw s!"argument schema '{key}' must be an array"
+        for v in values do validateArgumentSchema defs v seen (depth + if key == "fields" then 1 else 0)
+  | _ => throw "argument schema must be an object"
+
+/-- Each argument requires a schema; the empty schema explicitly means raw Data. -/
+private def parseArgument (defs : Lean.Json) (j : Lean.Json) : Except String ArgumentInfo := do
+  let encoding := parseArgEncoding (← getStr j "encoding")
+  let schema ← (j.getObjVal? "schema").mapError (fun _ => "argument is missing schema")
+  validateArgumentSchema defs schema
+  return { encoding, ptype := parseSchemaType defs schema 20 }
+
+/-- A non-negative integer JSON field, rejecting fractional/exponent forms. -/
+private def getNatField (j : Lean.Json) (key : String) : Option Nat :=
+  match j.getObjVal? key with
+  | .ok (.num n) => if n.exponent == 0 && n.mantissa ≥ 0 then some n.mantissa.toNat else none
+  | _            => none
+
+private def parseBudget (j : Lean.Json) : Except String BudgetInfo :=
+  match getNatField j "steps" with
+  | some n =>
+    if (j.getObjVal? "exCPU").isOk || (j.getObjVal? "exMem").isOk then
+      .error "steps and ledger execution units are mutually exclusive"
+    else match getOptStr j "semantics" with
+    | none => .ok (.steps n)
+    | some sem => if ["A", "B", "C", "D", "E"].contains sem then .ok (.semanticSteps n sem)
+                  else .error "semantics must be A, B, C, D, or E"
+  | none   =>
+    match getNatField j "exCPU", getNatField j "exMem" with
+    | some c, some m => .ok (.exUnits c m)
+    | _,      _      =>
+      .error "'budget' must be either {\"steps\": n} or {\"exCPU\": n, \"exMem\": m} \
+with non-negative integers"
+
+def interfaceSchemaUri : String :=
+  "https://cips.cardano.org/cips/cip57/extensions/compiled-interface/v1/schema.json"
+
+/-- Determine only the outer wire representation, without expanding data fields. -/
+private partial def rootEncoding (defs schema : Json) (seen : List String := []) : Except String ArgEncoding := do
+  if let some ref := getOptStr schema "$ref" then
+    unless ref.startsWith "#/definitions/" do throw "nonlocal schema reference"
+    let key := decodeJsonPointer (ref.drop 14)
+    if seen.contains key then throw "unguarded recursive schema encoding"
+    return ← rootEncoding defs (← defs.getObjVal? key) (key :: seen)
+  let kind := (getOptStr schema "dataType").getD ""
+  if kind.startsWith "#" then return .asNative kind
+  for key in ["oneOf", "anyOf"] do
+    if let .ok (.arr children) := schema.getObjVal? key then
+      for child in children do
+        unless (← rootEncoding defs child seen) == .asData do
+          throw "native values cannot occur inside Data alternatives"
+  return .asData
+
+/-- Validate a finite schema graph. Only cycles crossing a data field/container
+are productive. Every child still has its own representation checked. -/
+private partial def schemaEncoding (defs schema : Json)
+    (seen : List (String × Nat) := []) (depth : Nat := 0) : Except String ArgEncoding := do
+  if let some ref := getOptStr schema "$ref" then
+    if ["dataType", "anyOf", "oneOf", "allOf", "not", "encoding", "constructors"].any (fun k => (schema.getObjVal? k).isOk) then
+      throw "ambiguous schema representation beside reference"
+    unless ref.startsWith "#/definitions/" do throw "nonlocal schema reference"
+    let key := decodeJsonPointer (ref.drop 14)
+    let target ← (defs.getObjVal? key).mapError (fun _ => s!"unresolved argument schema '{key}'")
+    if let some prior := seen.lookup key then
+      unless depth > prior do throw "unguarded recursive schema encoding"
+      return ← rootEncoding defs target
+    return ← schemaEncoding defs target ((key, depth) :: seen) depth
+  if (schema.getObjVal? "allOf").isOk || (schema.getObjVal? "not").isOk then
+    throw "unsupported schema composition"
+  let kind := (getOptStr schema "dataType").getD ""
+  if kind != "" && ((schema.getObjVal? "anyOf").isOk || (schema.getObjVal? "oneOf").isOk) then
+    throw "ambiguous schema representation beside dataType"
+  if kind == "#scott" then throw "Scott encoding is not supported by this checking profile"
+  unless ["", "integer", "bytes", "list", "map", "constructor", "#integer", "#bytes", "#unit", "#boolean", "#string", "#list", "#pair"].contains kind do
+    throw s!"unsupported parameter dataType '{kind}'"
+  for key in ["items", "keys", "values", "left", "right", "fields", "oneOf", "anyOf"] do
+    if let .ok child := schema.getObjVal? key then
+      let children := match child with | .arr a => a | _ => #[child]
+      let next := depth + if ["items", "keys", "values", "left", "right", "fields"].contains key then 1 else 0
+      for c in children do
+        unless (← schemaEncoding defs c seen next) == .asData do
+          throw "native values cannot occur inside Data containers or Data alternatives"
+  return ← rootEncoding defs schema
+
+/-- Whether lowering would require a recursive generated host type. Such inputs
+stay raw Data, preserving arbitrary finite depth and the malformed-input domain. -/
+private partial def recursiveSchema (defs schema : Json) (seen : List String := []) : Bool :=
+  if let some ref := getOptStr schema "$ref" then
+    let key := decodeJsonPointer (ref.drop 14)
+    seen.contains key || ((defs.getObjVal? key).toOption.any fun target => recursiveSchema defs target (key :: seen))
+  else ["items", "keys", "values", "left", "right", "fields", "oneOf", "anyOf"].any fun key =>
+    match schema.getObjVal? key with
+    | .ok (.arr a) => a.any (recursiveSchema defs · seen)
+    | .ok child => recursiveSchema defs child seen
+    | _ => false
+
+/-- Standalone assurance functions use the same wire schema vocabulary. Data
+ADTs stay raw Data at this boundary, so no decoder silently narrows their domain. -/
+def parseFunctionWire (schema : Json) (defs : Json := Json.mkObj []) : Except String ArgumentInfo := do
+  let encoding ← schemaEncoding defs schema
+  validateArgumentSchema defs schema
+  let ptype := match encoding with
+    | .asData => PlutusType.data
+    | .asNative "#list" => .list .data
+    | .asNative "#pair" => .pair .data .data
+    | _ => parseSchemaType defs schema 20
+  return { encoding, ptype }
+
+private def purposeMatches (slot : Json) (purpose : String) : Bool :=
+  match slot.getObjVal? "purpose" with
+  | .error _ => true
+  | .ok (.str p) => p == purpose
+  | .ok p => ((p.getObjValAs? (Array String) "oneOf").toOption.getD #[]).contains purpose
+
+private def selectSlot (v : Json) (role purpose : String) : Except String Json := do
+  let slot ← v.getObjVal? role
+  match slot.getObjVal? "oneOf" with
+  | .ok (.arr choices) =>
+    let selected :=  choices.filter (purposeMatches · purpose)
+    unless selected.size == 1 do throw "ambiguous purpose-specific runtime schema"
+    return ← selected[0]!.getObjVal? "schema"
+  | _ =>
+    unless purposeMatches slot purpose do throw "runtime schema purpose mismatch"
+    slot.getObjVal? "schema"
+
+private def parseInterface (defs v : Json) (version : String) : Except String (Array (String × Array ArgumentInfo)) := do
+  let iface ← v.getObjVal? "interface"
+  let convention ← getStr iface "callingConvention"
+  unless convention == "ledger-" ++ version && ["v1", "v2", "v3"].contains version do
+    throw "calling convention does not match Plutus language"
+  let params := ((v.getObjValAs? (Array Json) "parameters").toOption).getD #[]
+  let invocations ← iface.getObjValAs? (Array Json) "invocations"
+  let mut results := #[]
+  let mut purposes : List String := []
+  for inv in invocations do
+    let purpose ← getStr inv "purpose"
+    if purposes.contains purpose then throw "duplicate invocation purpose"
+    purposes := purpose :: purposes
+    unless ["spend", "mint", "withdraw", "publish", "vote", "propose"].contains purpose do throw "unknown invocation purpose"
+    if version != "v3" && ["vote", "propose"].contains purpose then throw "purpose requires Plutus V3"
+    let suffix := if version == "v3" then ["context"] else if purpose == "spend" then ["datum", "redeemer", "context"] else ["redeemer", "context"]
+    let args ← inv.getObjValAs? (Array Json) "arguments"
+    unless args.size == params.size + suffix.length do throw "incomplete invocation arguments"
+    let mut parsed : Array ArgumentInfo := #[]
+    for i in [:params.size] do
+      let a := args[i]!
+      unless getOptStr a "role" == some "parameter" && getOptStr a "source" == some s!"/parameters/{i}" do
+        throw "parameter order/reference mismatch"
+      unless purposeMatches params[i]! purpose do throw "parameter purpose mismatch"
+      let schema ← params[i]!.getObjVal? "schema"
+      let encoding ← schemaEncoding defs schema
+      validateArgumentSchema defs schema
+      let ptype := match encoding with
+        | .asNative "#list" => PlutusType.list .data
+        | .asNative "#pair" => PlutusType.pair .data .data
+        | .asData => if recursiveSchema defs schema then .data else parseSchemaType defs schema 20
+        | _ => parseSchemaType defs schema 20
+      parsed := parsed.push { encoding, ptype }
+    for i in [:suffix.length] do
+      let role := suffix[i]!
+      let a := args[params.size + i]!
+      unless getOptStr a "role" == some role do throw "invalid runtime argument order"
+      if role == "context" then
+        if (a.getObjVal? "source").isOk then throw "context cannot override its source"
+      else
+        unless getOptStr a "source" == some ("/" ++ role) do throw "invalid runtime argument source"
+      parsed := parsed.push { encoding := .asData, ptype := .data }
+    -- V3 payload descriptions remain Data even though they are not positional.
+    for role in ["datum", "redeemer"] do
+      if (v.getObjVal? role).isOk then
+        let schema ← selectSlot v role purpose
+        unless (← schemaEncoding defs schema) == .asData do throw "runtime payload must be Data"
+      else if suffix.contains role then throw s!"missing runtime {role}"
+    results := results.push (purpose, parsed)
+  return results
+
+private def parseValidator (defs : Lean.Json) (extended : Bool) (version : String) (j : Lean.Json) : Except String BlueprintValidator := do
+  let title ← getStr j "title"
   let datum      := match j.getObjVal? "datum"      with | .ok d => some (parseSchemaInfo defs d) | _ => none
   let redeemer   := match j.getObjVal? "redeemer"   with | .ok r => some (parseSchemaInfo defs r) | _ => none
   let parameters := match j.getObjVal? "parameters" with
     | .ok (.arr arr) => arr.map (parseSchemaInfo defs)
     | _              => #[]
+  let arguments ← match j.getObjVal? "arguments" with
+    | .ok (.arr arr) =>
+      some <$> arr.mapM fun a =>
+        (parseArgument defs a).mapError (s!"validator '{title}': 'arguments': {·}")
+    | .ok _    => .error s!"validator '{title}': 'arguments' must be an array"
+    | .error _ => pure none
+  let budget ← match j.getObjVal? "budget" with
+    | .ok b    => some <$> (parseBudget b).mapError (s!"validator '{title}': {·}")
+    | .error _ => pure none
   return {
-    title        := ← getStr j "title"
+    title
     id           := getOptStr j "id"
     description  := getOptStr j "description"
     compiledCode := getOptStr j "compiledCode"
@@ -287,16 +576,24 @@ private def parseValidator (defs : Lean.Json) (j : Lean.Json) : Except String Bl
     datum
     redeemer
     parameters
+    arguments
+    budget
+    invocations := ← if extended then parseInterface defs j version else pure #[]
   }
 
 def parseBlueprint (s : String) : Except String Blueprint := do
   let json ← Lean.Json.parse s
+  let uri := getOptStr json "$schema"
+  let extended := uri == some interfaceSchemaUri
+  if extended then AssuranceSchema.validateDocument json
+  else if uri.isSome && uri != some "https://cips.cardano.org/cips/cip57/schemas/plutus-blueprint.json" then
+    throw "unsupported blueprint dialect"
   let preamble ← match json.getObjVal? "preamble" with
     | .ok j    => parsePreamble j
     | .error e => .error s!"missing 'preamble': {e}"
   let defs := match json.getObjVal? "definitions" with | .ok d => d | _ => .null
   let validators ← match json.getObjVal? "validators" with
-    | .ok (.arr arr) => arr.mapM (parseValidator defs)
+    | .ok (.arr arr) => arr.mapM (parseValidator defs extended preamble.plutusVersion)
     | .ok _          => .error "'validators' must be an array"
     | .error e       => .error s!"missing 'validators': {e}"
   -- Collect every nameable definition so it can be emitted as a Lean type.
@@ -306,7 +603,10 @@ def parseBlueprint (s : String) : Except String Blueprint := do
         if isNameableDef defn then (defTypeName key defn, parseSchemaType defs defn 20) :: acc
         else acc)
     | _ => []
-  return { preamble, validators, namedTypes }
+  if extended then
+    let ids := validators.toList.filterMap (·.id)
+    unless ids.length == ids.eraseDups.length do throw "duplicate validator id"
+  return { extended, preamble, validators, namedTypes }
 
 def sanitizeName (s : String) : String :=
   String.mk <| s.data.map fun c => if c.isAlphanum || c == '_' then c else '_'
@@ -360,10 +660,10 @@ private partial def topoOrderTypes
     match remaining with
     | [] => (acc, [])
     | _ =>
-      let ready := remaining.filter fun (sname, _, pt) =>
+      let ready := remaining.filter fun (_, _, pt) =>
         (collectNamedRefs pt).all fun r =>
           let rs := sanitizeName r
-          rs == sname || done.contains rs
+          done.contains rs
       if ready.isEmpty then
         (acc, remaining.map (·.1))
       else
@@ -546,21 +846,50 @@ def parseCommand (s : String) : CommandElabM Syntax := do
   | .ok stx  => return stx
   | .error e => throwError s!"Failed to parse generated command:\n{e}\n---\n{s}"
 
+/-- Parse a *sequence* of Lean commands from a string, as the frontend does.
+    `parseCommand` insists on a single command consuming the whole input, which
+    is not enough for externally supplied blocks of several declarations (e.g.
+    an assurance document's formal fragments). `label` names the source in
+    parse-error messages. -/
+def parseCommands (label : String) (s : String) : CommandElabM (Array Syntax) := do
+  let inputCtx := Lean.Parser.mkInputContext s label
+  let pmctx : Lean.Parser.ParserModuleContext :=
+    { env           := ← getEnv
+      options       := ← getOptions
+      currNamespace := ← getCurrNamespace
+      openDecls     := ← getOpenDecls }
+  let mut state    : Lean.Parser.ModuleParserState := {}
+  let mut msgs     : Lean.MessageLog := {}
+  let mut stxs     : Array Syntax := #[]
+  let mut terminal : Syntax := .missing
+  repeat
+    let (stx, state', msgs') := Lean.Parser.parseCommand inputCtx pmctx state msgs
+    state := state'
+    msgs  := msgs'
+    -- `isTerminalCommand` also fires on `import` / `#exit`, which would
+    -- silently truncate the rest of the block; `terminal` lets us reject those.
+    if Lean.Parser.isTerminalCommand stx then
+      terminal := stx
+      break
+    stxs := stxs.push stx
+  if msgs.hasErrors then
+    let texts ← msgs.toList.mapM fun m => m.toString
+    throwError s!"Failed to parse {label}:\n{String.intercalate "\n" texts}"
+  unless terminal.isOfKind ``Lean.Parser.Command.eoi do
+    throwError s!"{label}: `import` and `#exit` are not allowed here; the rest of the \
+block would be silently dropped."
+  return stxs
+
 /-- Run `action` with the namespace temporarily set to `ns` (absolute path).
     Saves and restores the full scope stack so that opens added by `action`
     don't leak into the caller's namespace, and any exception still restores. -/
-def withTempNamespace (ns : Name) (action : CommandElabM Unit) : CommandElabM Unit := do
+def withTempNamespace {α : Type} (ns : Name) (action : CommandElabM α) : CommandElabM α := do
   let savedScopes := (← get).scopes
-  -- Point the top scope at the absolute target namespace
   modifyScope fun s => { s with currNamespace := ns }
   try
     action
-  catch e =>
-    let postEnv := (← get).env
-    modify fun st => { st with scopes := savedScopes, env := postEnv }
-    throw e
-  let postEnv := (← get).env
-  modify fun st => { st with scopes := savedScopes, env := postEnv }
+  finally
+    modify fun st => { st with scopes := savedScopes }
 
 -- ---------------------------------------------------------------------------
 -- Emit a struct type (single constructor, named fields) + IsData instance.
@@ -712,6 +1041,120 @@ private def tryEmitSchemaType (ns : Name) (si : SchemaInfo) : CommandElabM Unit 
   | .named _ => return
   | pt => emitNamedType ns typeName pt
 
+-- ---------------------------------------------------------------------------
+-- Applied-validator wrapper: apply the compiled program to its declared
+-- `arguments` and run the CEK machine for the declared step budget.
+-- ---------------------------------------------------------------------------
+
+/-- Why no applied-validator wrapper can be emitted for a validator that
+    declares `arguments` — or `none` when one can. Every reason names the
+    blueprint feature that blocks it; nothing is guessed or defaulted. -/
+def wrapperBlocker (args : Array ArgumentInfo) (budget : Option BudgetInfo) : Option String :=
+  match args.findSome? (fun a =>
+      match a.encoding with
+      | .asData     => none
+      | .asNative kind =>
+        if ["#integer", "#bytes", "#string", "#boolean", "#unit", "#list", "#pair"].contains kind then none
+        else some s!"unsupported native encoding '{kind}'"
+      | .asScott    => some "an argument declares encoding 'asScott', and this package has \
+no Scott encoder (there is no `IsScott` class here or in `CardanoLedgerApi`), so the applied \
+term would have to be guessed"
+      | .other name => some s!"an argument declares the unknown encoding '{name}'") with
+  | some why => some why
+  | none =>
+    match budget with
+    | some (.steps _) | some (.semanticSteps ..) => none
+    | some (.exUnits c m) =>
+      some s!"'budget' is given as ledger execution units (exCPU {c}, exMem {m}), and there \
+is no conversion from execution units to the CEK step count `cekExecuteProgram` takes"
+    | none =>
+      some "the validator declares no 'budget', so there is no CEK step count to run with"
+
+/-- Source text turning wrapper binder `varName` into the `Term` the program is
+    applied to, under the `asData` encoding. A `Data` argument is injected
+    directly rather than through `IsData.toData`, so the emitted term is
+    syntactically the one hand-written CEK properties pass. -/
+private def argToTermStr (varName : String) : PlutusType → String
+  | .data =>
+    "PlutusCore.UPLC.Term.Term.Const (PlutusCore.UPLC.Term.Const.Data " ++ varName ++ ")"
+  | _ =>
+    "PlutusCore.UPLC.Term.Term.Const (PlutusCore.UPLC.Term.Const.Data (IsData.toData " ++
+      varName ++ "))"
+
+/-- Emit `<ns>.<wrapperName> : … → State`, applying the program of the
+    already-emitted `<ns>.<scriptName> : PlutusScript` to its encoded arguments
+    and running the CEK machine for `steps` steps.
+
+    Callers must have checked `wrapperBlocker` first. Data arguments use IsData;
+    native arguments use their declared builtin constant representation. -/
+def emitAppliedWrapper (ns : Name) (wrapperName scriptName : String)
+    (args : Array ArgumentInfo) (steps : Nat) (semantics : String := "E") : CommandElabM Unit := do
+  let idxs := List.range args.size
+  let binders := String.join <| idxs.map fun i =>
+    " (a" ++ toString i ++ " : " ++ plutusTypeToTypeStr args[i]!.ptype ++ ")"
+  let terms := String.intercalate ", " <| idxs.map fun i =>
+    let varName := "a" ++ toString i
+    match args[i]!.encoding with
+    | .asNative kind =>
+      let ctor := match kind with
+        | "#integer" => "Integer" | "#bytes" => "ByteString" | "#string" => "String"
+        | "#boolean" => "Bool" | "#list" => "ConstDataList" | "#pair" => "PairData" | _ => "Unit"
+      let payload := if kind == "#unit" then "" else " " ++ varName
+      "PlutusCore.UPLC.Term.Term.Const (PlutusCore.UPLC.Term.Const." ++ ctor ++ payload ++ ")"
+    | _ => argToTermStr varName args[i]!.ptype
+  let src :=
+    "/-- Applied `" ++ wrapperName ++ "`: the compiled program from the blueprint, applied \
+to its declared `arguments` and run on the CEK machine for " ++ toString steps ++ " steps. -/\n" ++
+    "def " ++ escapeIdent wrapperName ++ binders ++ " : PlutusCore.UPLC.CekMachine.State :=\n" ++
+    "  PlutusCore.UPLC.CekMachine.cekExecuteProgramWithSemanticVariant " ++
+      "PlutusCore.Default.Internal.BuiltinSemanticsVariant.defaultFunSemanticsVariant" ++ semantics ++ " " ++ escapeIdent scriptName ++
+      ".script [" ++ terms ++ "] " ++ toString steps
+  withTempNamespace ns do
+    -- Bring `IsData` / `Data` / `Integer` / `ByteString` short names into scope
+    -- (the binder types come from `plutusTypeToTypeStr`).
+    elabCommand (← parseCommand openDecl)
+    elabCommand (← parseCommand src)
+
+/-- Import a digest-checked function from assurance, retaining CEK state and
+exposing an exact return-value predicate (including its wire representation). -/
+def emitAssuranceFunction (ns : Name) (id code version : String)
+    (args : Array ArgumentInfo) (result : ArgumentInfo) (steps : Nat) (sem : String)
+    : CommandElabM Unit := do
+  let someId := sanitizeName id
+  let raw := someId ++ "_script"
+  for name in [someId, raw, someId ++ "_returns"] do
+    if (← getEnv).contains (Name.mkStr ns name) then throwError "function binding collision: {name}"
+  let prog ← ofExcept (singleCborEncodedScriptFromHex? code)
+  let lang ← ofExcept (plutusVersionToLangExpr version)
+  liftCoreM <| addAndCompile <| mkAbbrevDecl (Name.mkStr ns raw)
+    (mkConst ``PlutusScript) (mkApp2 (mkConst ``PlutusScript.mk) lang (toExpr prog))
+  emitAppliedWrapper ns someId raw args steps sem
+  let indices := List.range args.size
+  let binders := String.join <| indices.map fun i =>
+    s!" (a{i} : {plutusTypeToTypeStr args[i]!.ptype})"
+  let call := String.join <| indices.map fun i => s!" a{i}"
+  let value := match result.encoding with
+    | .asNative kind =>
+      let ctor := match kind with
+        | "#integer" => "Integer" | "#bytes" => "ByteString" | "#string" => "String"
+        | "#boolean" => "Bool" | "#list" => "ConstDataList" | "#pair" => "PairData" | _ => "Unit"
+      "PlutusCore.UPLC.Term.Const." ++ ctor ++ (if kind == "#unit" then "" else " actual")
+    | _ => "PlutusCore.UPLC.Term.Const.Data actual"
+  withTempNamespace ns do
+    elabCommand (← parseCommand openDecl)
+    let equal := if result.encoding == .asNative "#unit" then "True" else "actual = expected"
+    elabCommand (← parseCommand s!"def {escapeIdent (someId ++ "_returns")}{binders} (expected : {plutusTypeToTypeStr result.ptype}) : Prop :=\n  match {escapeIdent someId}{call} with\n  | PlutusCore.UPLC.CekMachine.State.Halt (PlutusCore.UPLC.CekValue.CekValue.VCon ({value})) => {equal}\n  | _ => False")
+
+/-- Recompute the CIP-57 script hash from the single-CBOR bytes and language tag. -/
+def actualScriptHash (version code : String) : Except String String := do
+  let tag ← match version.toLower with
+    | "v1" => pure 1 | "v2" => pure 2 | "v3" => pure 3
+    | _ => throw s!"unsupported Plutus language '{version}'"
+  let some chars := PlutusCore.UPLC.ScriptEncoding.Internal.hexStringToString code.data []
+    | throw "invalid compiledCode hex"
+  let bytes := UInt8.ofNat tag :: chars.map (fun c => UInt8.ofNat c.toNat)
+  return Cryptograph.String.uint8ListToHex (Cryptograph.Blake2b.blake2b_224 bytes)
+
 end Internal
 
 open Internal
@@ -737,11 +1180,36 @@ syntax (name := import_blueprints) "#import_blueprints" ident str : command
 /-- Core of `#import_blueprints`: parse the blueprint file at `filepath` and
     emit every declaration into namespace `ns`. Returns the parsed blueprint so
     other commands (e.g. `#verify_blueprint`) can inspect it. -/
-def elabBlueprintImport (ns : Name) (filepath : String) : CommandElabM Internal.Blueprint := do
+def elabBlueprintImport (ns : Name) (filepath : String)
+    (selections : List (String × String × BudgetInfo) := []) : CommandElabM Internal.Blueprint := do
   let content  ← liftM (IO.FS.readFile (System.FilePath.mk filepath))
   let blueprint ← match parseBlueprint content with
     | .ok b    => pure b
     | .error e => throwError s!"Failed to parse blueprint '{filepath}': {e}"
+
+  let blueprint ← if selections.isEmpty then pure blueprint else do
+    unless blueprint.extended do throwError "checking context requires compiled-interface dialect"
+    let validators ← blueprint.validators.mapM fun v => do
+      match selections.find? (fun (id, _, _) => v.id == some id) with
+      | none => pure v
+      | some (_, purpose, budget) =>
+        let some (_, args) := v.invocations.find? (fun i => i.1 == purpose)
+          | throwError "checking target selects unknown invocation"
+        pure { v with arguments := some args, budget := some budget }
+    pure { blueprint with validators }
+
+  -- Reject duplicate or colliding generated bindings before adding declarations.
+  let mut names : List String := []
+  for v in blueprint.validators do
+    for name in ([sanitizeName v.title] ++ (v.id.toList.map Internal.sanitizeName)).eraseDups do
+      if names.contains name then throwError s!"duplicate validator binding '{name}'"
+      names := name :: names
+    if let some code := v.compiledCode then
+      let actual ← match actualScriptHash blueprint.preamble.plutusVersion (String.trim code) with
+        | .ok h => pure h | .error e => throwError e
+      if let some expected := v.hash then
+        unless expected == actual do
+          throwError s!"Validator '{v.title}': compiledCode hash mismatch (declared {expected}, computed {actual})"
 
   let langExpr ← match plutusVersionToLangExpr blueprint.preamble.plutusVersion with
     | .ok e    => pure e
@@ -778,7 +1246,27 @@ no Lean type emitted (references to it stay raw Data)."
         throwError s!"Blueprint: failed to decode '{validator.title}': {msg}"
       | .ok prog =>
         let sanitized  := sanitizeName validator.title
-        let scriptName := Name.mkStr ns sanitized
+
+        -- Decide up front whether an applied-validator wrapper will take the
+        -- plain `<sanitized>` name; only then is the script renamed. Skipping
+        -- the wrapper must not orphan the plain name.
+        let wrapper : Option (Array ArgumentInfo × Nat × String) ←
+          match validator.arguments with
+          | none      => pure none
+          | some args =>
+            match wrapperBlocker args validator.budget with
+            | some why =>
+              logWarning s!"Blueprint: validator '{validator.title}' declares 'arguments', \
+but no applied-validator wrapper was emitted: {why}. '{sanitized}' stays bound to the \
+unapplied PlutusScript."
+              pure none
+            | none =>
+              match validator.budget with
+              | some (.steps n) => pure (some (args, n, "E"))
+              | some (.semanticSteps n sem) => pure (some (args, n, sem))
+              | _               => pure none   -- unreachable: ruled out by wrapperBlocker
+        let scriptShort := if wrapper.isSome then sanitized ++ "_script" else sanitized
+        let scriptName  := Name.mkStr ns scriptShort
 
         let scriptDecl ← liftTermElabM do
           pure <| mkAbbrevDecl scriptName
@@ -794,6 +1282,20 @@ no Lean type emitted (references to it stay raw Data)."
           liftCoreM <| addAndCompile <| mkAbbrevDecl
             (Name.mkStr ns (sanitized ++ "_paramCount"))
             (mkConst ``Nat) (toExpr validator.parameters.size)
+
+        -- The wrapper takes the plain name and refers to the renamed script.
+        if let some (args, steps, sem) := wrapper then
+          emitAppliedWrapper ns sanitized scriptShort args steps sem
+
+        -- A stable id is the UAL binding. Preserve title bindings for legacy callers.
+        if let some vid := validator.id then
+          let stable := sanitizeName vid
+          if stable != sanitized then
+            withTempNamespace ns do
+              elabCommand (← parseCommand s!"abbrev {escapeIdent stable} := {escapeIdent sanitized}")
+              if wrapper.isSome then
+                withTempNamespace ns do
+                  elabCommand (← parseCommand s!"abbrev {escapeIdent (stable ++ "_script")} := {escapeIdent scriptShort}")
 
         -- Reference the already-emitted constant (avoids duplicating the compiled AST)
         let optScriptExpr :=

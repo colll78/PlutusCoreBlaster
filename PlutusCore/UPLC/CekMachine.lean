@@ -148,18 +148,21 @@ def step (semanticsVariant : BuiltinSemanticsVariant) (Sigma : State) : State :=
   --   False | len == 1 || len == 2 -> HeadOnly (branches ! 0)
   --   True  | len == 2             -> HeadOnly (branches ! 1)
   --   _ -> HeadError (wrong number of branches)
-  | State.Return (Frame.CaseScrutinee Ms ρ :: s) (CekValue.VCon (Const.Bool false)) =>
-        if Ms.length == 1 || Ms.length == 2 then
-          match Ms[0]? with
-          | some mi => State.Eval s ρ mi
-          | none => State.Error
-        else State.Error
-  | State.Return (Frame.CaseScrutinee Ms ρ :: s) (CekValue.VCon (Const.Bool true)) =>
-        if Ms.length == 2 then
-          match Ms[1]? with
-          | some mi => State.Eval s ρ mi
-          | none => State.Error
-        else State.Error
+  -- Match the Bool constructor once, then branch on its payload. This keeps
+  -- symbolic booleans reducible without a residual match over the whole State.
+  | State.Return (Frame.CaseScrutinee Ms ρ :: s) (CekValue.VCon (Const.Bool b)) =>
+        if b then
+          if Ms.length == 2 then
+            match Ms[1]? with
+            | some mi => State.Eval s ρ mi
+            | none => State.Error
+          else State.Error
+        else
+          if Ms.length == 1 || Ms.length == 2 then
+            match Ms[0]? with
+            | some mi => State.Eval s ρ mi
+            | none => State.Error
+          else State.Error
 
   -- DefaultUniUnit: exactly 1 branch; HeadOnly (branches ! 0), no spine args
   | State.Return (Frame.CaseScrutinee Ms ρ :: s) (CekValue.VCon Const.Unit) =>
@@ -243,7 +246,7 @@ def runSteps (semanticsVariant : BuiltinSemanticsVariant) (Sigma : State) (n : N
   match n, Sigma with
   | _, State.Halt V => Sigma
   | _, State.Error => Sigma
-  | 0, _ => State.Error -- change to error when num steps exhausted
+  | 0, _ => Sigma -- fuel exhaustion is an unfinished computation, not script failure
   | Nat.succ n, _ => runSteps semanticsVariant (step semanticsVariant Sigma) n
 
 -- Define Apply Params
