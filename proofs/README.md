@@ -29,6 +29,8 @@ an insertion claim with its sortedness premise removed. Implementation helpers
 are named under `PlutusCore.Value.Internal` to make their equations accessible
 to this separate proof package; their bodies are unchanged.
 
+The solver features are proposed in [Lean-blaster #285](https://github.com/input-output-hk/Lean-blaster/pull/285). The commit pin keeps this package buildable while that PR is pending.
+
 ## Trust boundary
 
 These are SMT-verified facts. Blaster admits proved goals through the
